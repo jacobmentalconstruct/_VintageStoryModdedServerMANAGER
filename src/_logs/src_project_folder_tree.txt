@@ -1,0 +1,33 @@
+Project Tree: C:\Jacob\Scripts\_VintageStory_ServerMANAGER_v1.0\src
+Generated: 2026-02-14 17:43:54.222650
+
+├── 📁 orchestration_core/
+│   ├── 📄 __init__.py
+│   ├── 📄 app_controller.py
+│   ├── 📄 errors.py
+│   ├── 📄 state_store.py
+│   └── 📄 validators.py
+├── 📁 server_manager_core/
+│   ├── 📄 __init__.py
+│   ├── 📄 backup_manager.py
+│   ├── 📄 config_store.py
+│   ├── 📄 constants.py
+│   ├── 📄 models.py
+│   ├── 📄 port_checker.py
+│   └── 📄 server_process.py
+├── 📁 ui_core/
+│   ├── 📁 tabs/
+│   │   ├── 📄 backup_tab.py
+│   │   ├── 📄 base_tab.py
+│   │   ├── 📄 placeholder_tab.py
+│   │   ├── 📄 registry.py
+│   │   └── 📄 server_tab.py
+│   ├── 📁 widgets/
+│   │   └── 📄 log_view.py
+│   ├── 📄 __init__.py
+│   ├── 📄 log_sink.py
+│   ├── 📄 theme.py
+│   └── 📄 ui_app.py
+├── 📄 __init__.py
+├── 📄 app.py
+└── 📄 vs_server_manager_config.json

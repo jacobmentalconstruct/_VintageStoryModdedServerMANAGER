@@ -1,0 +1,2354 @@
+Dump: C:\Jacob\Scripts\_VintageStory_ServerMANAGER_v1.0\src
+
+
+--------------------------------------------------------------------------------
+FILE: app.py
+--------------------------------------------------------------------------------
+from pathlib import Path
+from src.ui_core import UiApp
+
+
+def main():
+    app_dir = Path(__file__).parent
+    UiApp(app_dir).run()
+
+
+if __name__ == "__main__":
+    main()
+
+
+--------------------------------------------------------------------------------
+FILE: vs_server_manager_config.json
+--------------------------------------------------------------------------------
+{
+  "server_exe_path": "",
+  "data_path": "",
+  "port": 42420,
+  "backup_root": "",
+  "backup_interval_minutes": 60,
+  "backup_retention_days": 7,
+  "backups_enabled": false,
+  "last_started_at": "",
+  "last_backup_at": ""
+}
+--------------------------------------------------------------------------------
+FILE: __init__.py
+--------------------------------------------------------------------------------
+# src package marker
+
+--------------------------------------------------------------------------------
+FILE: orchestration_core\app_controller.py
+--------------------------------------------------------------------------------
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Iterable, Optional, List
+
+from src.server_manager_core import (
+    CONFIG_FILENAME,
+    AppState,
+    ConfigStore,
+    PortChecker,
+    BackupManager,
+    ServerProcess,
+)
+
+from .state_store import StateStore
+from .validators import validate_paths_for_start, validate_backup_settings
+from .errors import ValidationError, NotRunningError
+
+
+class AppController:
+    """
+    UI-agnostic orchestration layer.
+
+    Owns:
+      - Live state store
+      - Config persistence
+      - Server process lifecycle
+      - Backup scheduler lifecycle
+      - Port check helpers
+
+    UI should:
+      - call controller methods
+      - render state from controller.get_state()
+      - append logs via log_fn passed into controller
+    """
+
+    def __init__(
+        self,
+        app_dir: Path,
+        log_fn: Callable[[str], None],
+        *,
+        config_filename: str = CONFIG_FILENAME,
+    ):
+        self._log = log_fn
+        self._app_dir = Path(app_dir).expanduser().resolve()
+        self._config_path = self._app_dir / config_filename
+
+        self._store = StateStore(AppState())
+        self._config = ConfigStore(self._config_path)
+
+        self._server = ServerProcess(self._log)
+        try:
+            import importlib
+            mod = importlib.import_module(ServerProcess.__module__)
+            mod_file = getattr(mod, "__file__", "<no __file__>")
+            self._log(f"[DEBUG] ServerProcess imported from: {ServerProcess.__module__} :: {mod_file}")
+        except Exception as e:
+            self._log(f"[DEBUG] ServerProcess import path check failed: {e}")
+
+        self._backups = BackupManager(self._log)
+
+        # Behavior flags / policies (tunable)
+        self.disallow_backups_while_server_running = True
+
+    # -------------------------
+    # State + persistence
+    # -------------------------
+
+    def load_state(self) -> AppState:
+        state = self._config.load()
+        self._store.set(state)
+        self._log(f"[OK] Loaded config: {self._config_path}")
+        return self.get_state()
+
+    def save_state(self) -> None:
+        state = self._store.get()
+        self._config.save(state)
+        self._log(f"[OK] Saved config: {self._config_path}")
+
+    def get_state(self) -> AppState:
+        return self._store.get()
+
+    def set_state(self, new_state: AppState) -> None:
+        self._store.set(new_state)
+
+    def update_state(self, fn: Callable[[AppState], AppState]) -> AppState:
+        return self._store.update(fn)
+
+    # -------------------------
+    # Server lifecycle
+    # -------------------------
+
+    def is_server_running(self) -> bool:
+        return self._server.is_running()
+
+    def start_server(self) -> None:
+        state = self.get_state()
+        validate_paths_for_start(state)
+
+        self._server.start(state.server_exe_path, state.data_path)
+
+        # stamp
+        self.update_state(lambda s: replace(
+            s,
+            last_started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+
+    def stop_server_graceful(self) -> None:
+        if not self._server.is_running():
+            raise NotRunningError("Server is not running.")
+        self._server.stop_graceful()
+
+    def stop_server_force(self) -> None:
+        if not self._server.is_running():
+            raise NotRunningError("Server is not running.")
+        self._server.stop_force()
+
+    def kill_server(self) -> None:
+        if not self._server.is_running():
+            raise NotRunningError("Server is not running.")
+        self._server.kill()
+
+    def send_server_command(self, cmd: str) -> None:
+        if not self._server.is_running():
+            raise NotRunningError("Server is not running.")
+        self._server.send_command(cmd)
+
+    def poll_server_exit(self) -> Optional[int]:
+        """A2: Check if the server has exited; returns exit code if stopped, else None."""
+        return self._server.poll_exit()
+
+    def poll_server_output(self, max_lines: int = 200) -> List[str]:
+        """
+        Drain buffered output lines from the server process.
+        UI orchestrator typically calls this in a Tk `after()` loop and writes lines to its log view.
+
+        A2: also polls for exit so an exit warning line is emitted into the output queue.
+        """
+        self._server.poll_exit()
+        return self._server.poll_output(max_lines=max_lines)
+
+    # -------------------------
+    # Backups
+    # -------------------------
+
+    def backups_start_scheduler(self) -> None:
+        """
+        Starts the backup scheduler thread if it isn't running.
+        The scheduler reads state via get_state_fn each cycle.
+        """
+        # validate if enabled (we don't want the scheduler to spam errors)
+        state = self.get_state()
+        if state.backups_enabled:
+            validate_backup_settings(state)
+
+        self._backups.start_scheduler(
+            get_state_fn=self.get_state,
+            set_state_fn=self.set_state,
+            can_backup_fn=self._can_backup_now,
+        )
+        self._log("[OK] Backup scheduler started.")
+
+    def backups_stop_scheduler(self) -> None:
+        self._backups.stop_scheduler()
+        self._log("[OK] Backup scheduler stop requested.")
+
+    def set_backups_enabled(self, enabled: bool) -> None:
+        def _mut(s: AppState) -> AppState:
+            return replace(s, backups_enabled=bool(enabled))
+        state = self.update_state(_mut)
+        if enabled:
+            validate_backup_settings(state)
+        self._log(f"[OK] Backups enabled = {enabled}")
+
+    def open_backup_folder(self) -> None:
+        self._backups.open_backup_folder(self.get_state())
+
+    def open_data_folder(self) -> None:
+        self._backups.open_data_folder(self.get_state())
+
+    def _can_backup_now(self) -> bool:
+        if self.disallow_backups_while_server_running and self._server.is_running():
+            return False
+        return True
+
+    # -------------------------
+    # Wave B: Vault helpers
+    # -------------------------
+
+    def list_backups(self):
+        """Wave B: List snapshot zips in backup_root (newest-first)."""
+        state = self.get_state()
+        root = (state.backup_root or "").strip()
+        if not root:
+            return []
+        return self._backups.list_backups(Path(root))
+
+    def restore_backup(self, zip_path: str) -> None:
+        """
+        Wave B: Point-in-time restore.
+
+        Policy:
+          - Requires data_path
+          - Restores into <data_path>/Saves
+          - If the server is running, refuse (UI should stop server first)
+        """
+        state = self.get_state()
+        if not state.data_path:
+            raise ValidationError("Data path is not set. Configure it in the Server tab first.")
+
+        if self._server.is_running():
+            raise ValidationError("Refusing restore while server is running. Stop the server first.")
+
+        data_root = Path(state.data_path).expanduser().resolve()
+        saves_dir = data_root / "Saves"
+
+        zp = Path(zip_path).expanduser().resolve()
+        self._log(f"[INFO] Restore requested: {zp}")
+        self._log(f"[INFO] Restore target: {saves_dir}")
+
+        renamed = self._backups.restore_backup_zip(zp, saves_dir, safety_rename=True)
+        if str(renamed):
+            self._log(f"[WARN] Previous Saves folder archived as: {renamed}")
+
+        self._log("[OK] Restore completed.")
+
+    # -------------------------
+    # Network helpers
+    # -------------------------
+
+    def is_port_listening_localhost(self, port: Optional[int] = None) -> bool:
+        state = self.get_state()
+        p = int(port) if port is not None else int(state.port)
+        return PortChecker.is_tcp_listening("127.0.0.1", p)
+
+
+
+
+
+
+
+--------------------------------------------------------------------------------
+FILE: orchestration_core\errors.py
+--------------------------------------------------------------------------------
+class OrchestrationError(Exception):
+    """Base exception for orchestration_core."""
+
+
+class ValidationError(OrchestrationError):
+    """State/config is invalid for the requested operation."""
+
+
+class NotRunningError(OrchestrationError):
+    """Requested operation requires a running server, but it isn't running."""
+
+
+--------------------------------------------------------------------------------
+FILE: orchestration_core\state_store.py
+--------------------------------------------------------------------------------
+from __future__ import annotations
+
+import threading
+from copy import deepcopy
+from typing import Callable
+
+from src.server_manager_core.models import AppState
+
+
+class StateStore:
+    """
+    Holds the live AppState + provides thread-safe get/set/update.
+    - UI and background threads (backup scheduler / server output pump) may both touch state.
+    - We store a private copy; get() returns a deepcopy so callers can't mutate without set/update.
+    """
+
+    def __init__(self, initial: AppState | None = None):
+        self._lock = threading.RLock()
+        self._state = initial if initial is not None else AppState()
+
+    def get(self) -> AppState:
+        with self._lock:
+            return deepcopy(self._state)
+
+    def set(self, new_state: AppState) -> None:
+        with self._lock:
+            self._state = deepcopy(new_state)
+
+    def update(self, fn: Callable[[AppState], AppState]) -> AppState:
+        """
+        Apply fn to a mutable copy of state, store the result, return stored copy.
+        """
+        with self._lock:
+            draft = deepcopy(self._state)
+            updated = fn(draft)
+            self._state = deepcopy(updated)
+            return deepcopy(self._state)
+
+
+--------------------------------------------------------------------------------
+FILE: orchestration_core\validators.py
+--------------------------------------------------------------------------------
+from pathlib import Path
+from .errors import ValidationError
+from src.server_manager_core.models import AppState
+
+
+def validate_paths_for_start(state: AppState) -> None:
+    exe = Path(state.server_exe_path).expanduser()
+    data = Path(state.data_path).expanduser()
+
+    if not state.server_exe_path.strip():
+        raise ValidationError("server_exe_path is empty.")
+    if not exe.exists():
+        raise ValidationError(f"Server executable not found: {exe}")
+    if not state.data_path.strip():
+        raise ValidationError("data_path is empty.")
+    if not data.exists():
+        raise ValidationError(f"Data path not found: {data}")
+    if not (1 <= int(state.port) <= 65535):
+        raise ValidationError(f"Port out of range: {state.port}")
+
+
+def validate_backup_settings(state: AppState) -> None:
+    if not state.backup_root.strip():
+        raise ValidationError("backup_root is empty.")
+    if state.backup_interval_minutes <= 0:
+        raise ValidationError("backup_interval_minutes must be > 0.")
+    if state.backup_retention_days < 0:
+        raise ValidationError("backup_retention_days must be >= 0.")
+
+
+--------------------------------------------------------------------------------
+FILE: orchestration_core\__init__.py
+--------------------------------------------------------------------------------
+from .app_controller import AppController
+
+__all__ = ["AppController"]
+
+
+--------------------------------------------------------------------------------
+FILE: server_manager_core\backup_manager.py
+--------------------------------------------------------------------------------
+import os
+import time
+import shutil
+import zipfile
+import threading
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+
+@dataclass
+class BackupInfo:
+    filename: str
+    path: str
+    size_bytes: int
+    mtime_epoch: float
+
+    @property
+    def mtime_local(self) -> str:
+        return datetime.fromtimestamp(self.mtime_epoch).strftime("%Y-%m-%d %H:%M:%S")
+
+    @property
+    def size_kib(self) -> float:
+        return self.size_bytes / 1024.0
+
+
+class BackupManager:
+    def __init__(self, log_fn):
+        self.log = log_fn
+        self.can_backup_fn = None  # optional: callable -> bool (True means backups allowed)
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start_scheduler(self, get_state_fn, set_state_fn, can_backup_fn=None):
+        if self._thread and self._thread.is_alive():
+            return
+        self.can_backup_fn = can_backup_fn
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._scheduler_loop,
+            args=(get_state_fn, set_state_fn, can_backup_fn),
+            daemon=True
+        )
+        self._thread.start()
+
+    def stop_scheduler(self):
+        self._stop_event.set()
+
+    def _scheduler_loop(self, get_state_fn, set_state_fn, can_backup_fn=None):
+        while not self._stop_event.is_set():
+            state = get_state_fn()
+            if state.backups_enabled:
+                # Wait in small increments so disabling backups takes effect quickly
+                total_sleep = max(1, int(state.backup_interval_minutes * 60))
+                slept = 0
+                while slept < total_sleep and not self._stop_event.is_set():
+                    time.sleep(1)
+                    slept += 1
+                    # Re-check enabled flag quickly
+                    if not get_state_fn().backups_enabled:
+                        break
+
+                # If still enabled, do a backup
+                if get_state_fn().backups_enabled:
+                    try:
+                        if can_backup_fn and not can_backup_fn():
+                            self.log("[WARN] Backup skipped: server running or backups disallowed right now.")
+                        else:
+                            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                            state = get_state_fn()
+                            backup_root = Path(state.backup_root).expanduser().resolve()
+                            backup_root.mkdir(parents=True, exist_ok=True)
+
+                            source_path = Path(state.data_path).expanduser().resolve()
+                            if not source_path.exists():
+                                self.log(f"[WARN] Backup skipped: data path does not exist: {source_path}")
+                            else:
+                                filename = f"vs_backup_{ts}.zip"
+                                dest_zip = backup_root / filename
+                                self._create_zip_backup(source_path, dest_zip)
+                                self.log(f"[OK] Backup created: {dest_zip}")
+
+                                # Update last_backup_at
+                                state.last_backup_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                set_state_fn(state)
+
+                                # Retention cleanup
+                                self._cleanup_retention(backup_root, state.backup_retention_days)
+
+                    except Exception as e:
+                        self.log(f"[ERROR] Backup failed: {e}")
+            else:
+                # Idle sleep
+                time.sleep(1)
+
+    def _create_zip_backup(self, source_path: Path, dest_zip: Path):
+        # Use ZIP_DEFLATED for a reasonable balance of size/speed
+        with zipfile.ZipFile(dest_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(source_path):
+                rootp = Path(root)
+                for f in files:
+                    fp = rootp / f
+                    rel = fp.relative_to(source_path)
+                    zf.write(fp, arcname=str(rel))
+
+    def _cleanup_retention(self, backup_root: Path, retention_days: int):
+        # Remove backups older than retention_days (based on file mtime)
+        if retention_days <= 0:
+            return
+        cutoff = time.time() - (retention_days * 86400)
+        removed = 0
+        for p in backup_root.glob("vs_backup_*.zip"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    removed += 1
+            except Exception:
+                pass
+        if removed:
+            self.log(f"[OK] Retention cleanup removed {removed} old backup(s).")
+
+    # ------------------------------------------------------------
+    # Wave B1: Vault helpers
+    # ------------------------------------------------------------
+
+    def list_backups(self, backup_root: Path) -> list[BackupInfo]:
+        """Return backups sorted newest-first."""
+        backup_root = Path(backup_root).expanduser().resolve()
+        if not backup_root.exists():
+            return []
+
+        items: list[BackupInfo] = []
+        for p in backup_root.glob("vs_backup_*.zip"):
+            try:
+                st = p.stat()
+                items.append(
+                    BackupInfo(
+                        filename=p.name,
+                        path=str(p),
+                        size_bytes=int(st.st_size),
+                        mtime_epoch=float(st.st_mtime),
+                    )
+                )
+            except Exception:
+                continue
+
+        items.sort(key=lambda b: b.mtime_epoch, reverse=True)
+        return items
+
+    def restore_backup_zip(
+        self,
+        zip_path: Path,
+        restore_target_dir: Path,
+        safety_rename: bool = True,
+    ) -> Path:
+        """
+        Restore a snapshot zip into restore_target_dir.
+
+        Atomic-ish restore strategy:
+          1) If restore_target_dir exists and safety_rename=True, rename it to <name>.bak_<timestamp>
+          2) Create restore_target_dir fresh
+          3) Extract zip into restore_target_dir
+
+        Returns:
+          Path to the renamed backup folder if it existed, else Path("")
+        """
+        zip_path = Path(zip_path).expanduser().resolve()
+        restore_target_dir = Path(restore_target_dir).expanduser().resolve()
+
+        if not zip_path.exists():
+            raise FileNotFoundError(f"Backup zip not found: {zip_path}")
+
+        renamed_path = Path("")
+
+        if restore_target_dir.exists() and safety_rename:
+            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            renamed_path = restore_target_dir.with_name(restore_target_dir.name + f".bak_{ts}")
+            # Ensure we don't collide
+            if renamed_path.exists():
+                # extremely unlikely, but keep deterministic
+                renamed_path = restore_target_dir.with_name(restore_target_dir.name + f".bak_{ts}_{int(time.time())}")
+
+            self.log(f"[WARN] Renaming current folder to: {renamed_path}")
+            restore_target_dir.rename(renamed_path)
+
+        # fresh target
+        restore_target_dir.mkdir(parents=True, exist_ok=True)
+
+        self.log(f"[INFO] Restoring backup zip: {zip_path}")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(path=restore_target_dir)
+
+        self.log(f"[OK] Restore complete: {restore_target_dir}")
+        return renamed_path
+
+    def open_backup_folder(self, state):
+        try:
+            p = Path(state.backup_root).expanduser().resolve()
+            p.mkdir(parents=True, exist_ok=True)
+            # Cross-platform open
+            if os.name == "nt":
+                os.startfile(str(p))  # type: ignore[attr-defined]
+            else:
+                # Linux/macOS
+                import subprocess
+                subprocess.Popen(["xdg-open", str(p)])
+        except Exception as e:
+            self.log(f"[ERROR] Could not open backup folder: {e}")
+
+    def open_data_folder(self, state):
+        try:
+            p = Path(state.data_path).expanduser().resolve()
+            if not p.exists():
+                self.log(f"[WARN] Data path does not exist: {p}")
+                return
+            if os.name == "nt":
+                os.startfile(str(p))  # type: ignore[attr-defined]
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", str(p)])
+        except Exception as e:
+            self.log(f"[ERROR] Could not open data folder: {e}")
+
+
+
+--------------------------------------------------------------------------------
+FILE: server_manager_core\config_store.py
+--------------------------------------------------------------------------------
+import json
+from dataclasses import asdict
+from pathlib import Path
+
+from .models import AppState
+
+
+class ConfigStore:
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+
+    def load(self) -> AppState:
+        if not self.config_path.exists():
+            return AppState()
+        try:
+            data = json.loads(self.config_path.read_text(encoding="utf-8"))
+            return AppState(**data)
+        except Exception:
+            # If config is corrupt, fall back safely
+            return AppState()
+
+    def save(self, state: AppState) -> None:
+        self.config_path.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
+
+
+--------------------------------------------------------------------------------
+FILE: server_manager_core\constants.py
+--------------------------------------------------------------------------------
+CONFIG_FILENAME = "vs_server_manager_config.json"
+
+
+--------------------------------------------------------------------------------
+FILE: server_manager_core\models.py
+--------------------------------------------------------------------------------
+from dataclasses import dataclass
+
+@dataclass
+class AppState:
+    server_exe_path: str = ""
+    data_path: str = ""
+    port: int = 42420
+
+    backup_root: str = ""
+    backup_interval_minutes: int = 60
+    backup_retention_days: int = 7
+    backups_enabled: bool = False
+
+    last_started_at: str = ""
+    last_backup_at: str = ""
+
+
+--------------------------------------------------------------------------------
+FILE: server_manager_core\port_checker.py
+--------------------------------------------------------------------------------
+import socket
+
+
+class PortChecker:
+    """
+    Practical check:
+      - TCP connect to localhost:port to detect if something is listening.
+    Note:
+      - This does NOT prove WAN reachability.
+      - Vintage Story may use both TCP and UDP on 42420; UDP "listening" is not as
+        straightforward to test generically from a local-only tool.
+    """
+    @staticmethod
+    def is_tcp_listening(host: str, port: int, timeout: float = 0.4) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+
+--------------------------------------------------------------------------------
+FILE: server_manager_core\server_process.py
+--------------------------------------------------------------------------------
+import queue
+import threading
+import subprocess
+
+
+class ServerProcess:
+    def __init__(self, log_fn):
+        self.log = log_fn
+        self.proc: subprocess.Popen | None = None
+        self._out_thread = None
+        self._out_queue = queue.Queue()
+        self._stop_read = threading.Event()
+
+    def is_running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, exe_path: str, data_path: str, extra_args=None):
+        if self.is_running():
+            self.log("[WARN] Server already running.")
+            return
+
+        args = [exe_path, "--dataPath", data_path]
+        if extra_args:
+            args.extend(extra_args)
+
+        self.log(f"[INFO] Starting server: {' '.join(args)}")
+        self._stop_read.clear()
+
+        self.proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+
+        self._out_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._out_thread.start()
+
+    def _reader_loop(self):
+        if not self.proc or not self.proc.stdout:
+            return
+        for line in self.proc.stdout:
+            if self._stop_read.is_set():
+                break
+            self._out_queue.put(line.rstrip("\n"))
+        self._out_queue.put("[INFO] Server output stream ended.")
+
+    def poll_output(self, max_lines: int = 100):
+        lines = []
+        for _ in range(max_lines):
+            try:
+                lines.append(self._out_queue.get_nowait())
+            except queue.Empty:
+                break
+        return lines
+
+    def poll_exit(self):
+        """Return the process returncode if it has exited, else None."""
+        if self.proc is None:
+            return None
+        return self.proc.poll()
+
+    def send_command(self, cmd: str):
+        if not self.is_running():
+            self.log("[WARN] Server not running; cannot send command.")
+            return
+        try:
+            assert self.proc is not None
+            if self.proc.stdin:
+                self.proc.stdin.write(cmd + "\n")
+                self.proc.stdin.flush()
+        except Exception as e:
+            self.log(f"[ERROR] Failed to send command: {e}")
+
+    def stop_graceful(self):
+        if not self.is_running():
+            return
+        self.log("[INFO] Attempting graceful stop...")
+        self.send_command("/stop")
+
+    def stop_force(self):
+        if not self.is_running():
+            return
+        self.log("[WARN] Forcing server termination...")
+        try:
+            assert self.proc is not None
+            self.proc.terminate()
+        except Exception:
+            pass
+
+    def kill(self):
+        if not self.is_running():
+            return
+        try:
+            assert self.proc is not None
+            self.proc.kill()
+        except Exception:
+            pass
+
+
+
+
+
+
+
+
+
+
+
+--------------------------------------------------------------------------------
+FILE: server_manager_core\__init__.py
+--------------------------------------------------------------------------------
+from .constants import CONFIG_FILENAME
+from .models import AppState
+from .config_store import ConfigStore
+from .port_checker import PortChecker
+from .backup_manager import BackupManager
+from .server_process import ServerProcess
+
+__all__ = [
+    "CONFIG_FILENAME",
+    "AppState",
+    "ConfigStore",
+    "PortChecker",
+    "BackupManager",
+    "ServerProcess",
+]
+
+
+--------------------------------------------------------------------------------
+FILE: ui_core\log_sink.py
+--------------------------------------------------------------------------------
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, List
+import threading
+
+
+@dataclass
+class LogLine:
+    text: str
+
+
+class LogSink:
+    """
+    Thread-safe log buffer.
+    - Controller and background threads can call .write()
+    - UI drains with .drain()
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._lines: List[LogLine] = []
+
+    def write(self, text: str) -> None:
+        with self._lock:
+            self._lines.append(LogLine(text=str(text)))
+
+    def drain(self, max_lines: int = 500) -> List[str]:
+        with self._lock:
+            if not self._lines:
+                return []
+            take = self._lines[:max_lines]
+            self._lines = self._lines[max_lines:]
+        return [l.text for l in take]
+
+
+--------------------------------------------------------------------------------
+FILE: ui_core\theme.py
+--------------------------------------------------------------------------------
+# src/ui_core/theme.py
+from __future__ import annotations
+
+import tkinter as tk
+from tkinter import ttk
+
+
+# ============================================================
+# THEME CONTROL PANEL
+# ============================================================
+# All colors live here so you can tweak quickly or modularize later.
+PALETTE = {
+    # Core surfaces (stone/soil)
+    "bg":            "#141311",  # main window background (deep soot)
+    "panel":         "#1B1916",  # panels / frames
+    "panel_2":       "#211E1A",  # slightly lifted panels
+    "border":        "#2E2A24",  # subtle separators
+
+    # Text
+    "text":          "#E8E2D6",  # warm parchment
+    "text_dim":      "#B8AF9F",  # muted parchment
+    "text_disabled": "#7B7468",
+
+    # Inputs
+    "input_bg":      "#171614",
+    "input_border":  "#3A342C",
+    "caret":         "#E8E2D6",
+
+    # Accent (bronze/ember)
+    "accent":        "#C58B3A",  # bronze
+    "accent_2":      "#A36A2C",  # deeper bronze
+    "ember":         "#D96D2B",  # warm ember (warnings / highlights)
+    "danger":        "#D24C3F",  # danger
+    "ok":            "#78B26E",  # ok (mossy green)
+
+    # Selection / focus
+    "select_bg":     "#2C241B",
+    "select_fg":     "#F2EADB",
+    "focus":         "#C58B3A",
+
+    # Notebook tabs
+    "tab_bg":        "#1B1916",
+    "tab_active_bg": "#24211D",
+    "tab_hover_bg":  "#201D19",
+}
+
+FONTS = {
+    "base": ("Segoe UI", 10),
+    "mono": ("Consolas", 10),
+    "heading": ("Segoe UI Semibold", 10),
+}
+
+SIZES = {
+    "pad_x": 10,
+    "pad_y": 8,
+    "border": 1,
+    "focus_thickness": 1,
+    "entry_pad_y": 6,
+    "button_pad_y": 7,
+}
+
+# ============================================================
+# THEME IMPLEMENTATION
+# ============================================================
+
+class Theme:
+    """
+    Vintage Story-inspired dark theme for ttk.
+
+    Notes:
+      - We use 'clam' as a stable base theme across platforms.
+      - Many ttk widgets don't support true background setting on all OS themes;
+        clam generally respects style configs well.
+    """
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.style = ttk.Style(root)
+
+    def apply(self) -> None:
+        # Pick a base theme that respects custom styling.
+        try:
+            self.style.theme_use("clam")
+        except Exception:
+            pass
+
+        # Root / default Tk options
+        self.root.configure(background=PALETTE["bg"])
+        self.root.option_add("*Font", FONTS["base"])
+        self.root.option_add("*Background", PALETTE["bg"])
+        self.root.option_add("*Foreground", PALETTE["text"])
+        self.root.option_add("*insertBackground", PALETTE["caret"])
+
+        # ---------- Base styles ----------
+        self.style.configure(
+            ".",
+            background=PALETTE["bg"],
+            foreground=PALETTE["text"],
+            fieldbackground=PALETTE["input_bg"],
+            bordercolor=PALETTE["border"],
+            lightcolor=PALETTE["border"],
+            darkcolor=PALETTE["border"],
+            troughcolor=PALETTE["panel"],
+            relief="flat",
+        )
+
+        self.style.configure(
+            "TFrame",
+            background=PALETTE["panel"],
+        )
+
+        self.style.configure(
+            "TLabel",
+            background=PALETTE["panel"],
+            foreground=PALETTE["text"],
+        )
+
+        self.style.configure(
+            "Heading.TLabel",
+            background=PALETTE["panel"],
+            foreground=PALETTE["text"],
+            font=FONTS["heading"],
+        )
+
+        # LabelFrame: frame background + label text color
+        self.style.configure(
+            "TLabelframe",
+            background=PALETTE["panel"],
+            bordercolor=PALETTE["border"],
+            lightcolor=PALETTE["border"],
+            darkcolor=PALETTE["border"],
+            relief="groove",
+        )
+        self.style.configure(
+            "TLabelframe.Label",
+            background=PALETTE["panel"],
+            foreground=PALETTE["text_dim"],
+            font=FONTS["heading"],
+        )
+
+        # ---------- Buttons ----------
+        self.style.configure(
+            "TButton",
+            background=PALETTE["panel_2"],
+            foreground=PALETTE["text"],
+            bordercolor=PALETTE["border"],
+            focusthickness=SIZES["focus_thickness"],
+            focuscolor=PALETTE["focus"],
+            padding=(12, SIZES["button_pad_y"]),
+        )
+        self.style.map(
+            "TButton",
+            background=[
+                ("disabled", PALETTE["panel"]),
+                ("pressed", PALETTE["tab_active_bg"]),
+                ("active", PALETTE["tab_hover_bg"]),
+            ],
+            foreground=[
+                ("disabled", PALETTE["text_disabled"]),
+            ],
+            bordercolor=[
+                ("focus", PALETTE["focus"]),
+                ("active", PALETTE["accent_2"]),
+            ],
+        )
+
+        # Accent button (use this style name where you want primary actions)
+        self.style.configure(
+            "Accent.TButton",
+            background=PALETTE["accent_2"],
+            foreground="#1A1410",
+            bordercolor=PALETTE["accent"],
+            focusthickness=SIZES["focus_thickness"],
+            focuscolor=PALETTE["focus"],
+            padding=(12, SIZES["button_pad_y"]),
+        )
+        self.style.map(
+            "Accent.TButton",
+            background=[
+                ("disabled", PALETTE["panel"]),
+                ("pressed", PALETTE["accent"]),
+                ("active", PALETTE["accent"]),
+            ],
+            foreground=[
+                ("disabled", PALETTE["text_disabled"]),
+                ("active", "#140F0B"),
+            ],
+            bordercolor=[
+                ("focus", PALETTE["focus"]),
+                ("active", PALETTE["ember"]),
+            ],
+        )
+
+        # Danger button (optional)
+        self.style.configure(
+            "Danger.TButton",
+            background=PALETTE["danger"],
+            foreground="#140F0B",
+            bordercolor=PALETTE["danger"],
+            padding=(12, SIZES["button_pad_y"]),
+        )
+        self.style.map(
+            "Danger.TButton",
+            background=[
+                ("disabled", PALETTE["panel"]),
+                ("pressed", "#B84036"),
+                ("active", "#C7463C"),
+            ],
+            foreground=[("disabled", PALETTE["text_disabled"])],
+        )
+
+        # ---------- Entries ----------
+        self.style.configure(
+            "TEntry",
+            fieldbackground=PALETTE["input_bg"],
+            background=PALETTE["input_bg"],
+            foreground=PALETTE["text"],
+            bordercolor=PALETTE["input_border"],
+            lightcolor=PALETTE["input_border"],
+            darkcolor=PALETTE["input_border"],
+            padding=(10, SIZES["entry_pad_y"]),
+            insertcolor=PALETTE["caret"],
+        )
+        self.style.map(
+            "TEntry",
+            bordercolor=[
+                ("focus", PALETTE["focus"]),
+                ("active", PALETTE["accent_2"]),
+            ],
+            foreground=[
+                ("disabled", PALETTE["text_disabled"]),
+            ],
+            fieldbackground=[
+                ("disabled", PALETTE["panel"]),
+            ],
+        )
+
+        # ---------- Checkbutton / Radiobutton ----------
+        self.style.configure(
+            "TCheckbutton",
+            background=PALETTE["panel"],
+            foreground=PALETTE["text"],
+        )
+        self.style.map(
+            "TCheckbutton",
+            foreground=[("disabled", PALETTE["text_disabled"])],
+            background=[("active", PALETTE["panel"])],
+        )
+
+        self.style.configure(
+            "TRadiobutton",
+            background=PALETTE["panel"],
+            foreground=PALETTE["text"],
+        )
+
+        # ---------- Combobox ----------
+        self.style.configure(
+            "TCombobox",
+            fieldbackground=PALETTE["input_bg"],
+            background=PALETTE["input_bg"],
+            foreground=PALETTE["text"],
+            bordercolor=PALETTE["input_border"],
+            arrowsize=14,
+            padding=(10, SIZES["entry_pad_y"]),
+        )
+        self.style.map(
+            "TCombobox",
+            bordercolor=[
+                ("focus", PALETTE["focus"]),
+                ("active", PALETTE["accent_2"]),
+            ],
+            fieldbackground=[
+                ("readonly", PALETTE["input_bg"]),
+                ("disabled", PALETTE["panel"]),
+            ],
+            foreground=[
+                ("disabled", PALETTE["text_disabled"]),
+            ],
+        )
+
+        # ---------- Notebook ----------
+        self.style.configure(
+            "TNotebook",
+            background=PALETTE["bg"],
+            bordercolor=PALETTE["border"],
+            padding=0,
+        )
+        self.style.configure(
+            "TNotebook.Tab",
+            background=PALETTE["tab_bg"],
+            foreground=PALETTE["text_dim"],
+            padding=(12, 8),
+            bordercolor=PALETTE["border"],
+        )
+        self.style.map(
+            "TNotebook.Tab",
+            background=[
+                ("selected", PALETTE["tab_active_bg"]),
+                ("active", PALETTE["tab_hover_bg"]),
+            ],
+            foreground=[
+                ("selected", PALETTE["select_fg"]),
+                ("active", PALETTE["text"]),
+            ],
+        )
+
+        # ---------- Scrollbars ----------
+        self.style.configure(
+            "Vertical.TScrollbar",
+            background=PALETTE["panel"],
+            troughcolor=PALETTE["input_bg"],
+            bordercolor=PALETTE["border"],
+            arrowcolor=PALETTE["text_dim"],
+            gripcount=0,
+        )
+        self.style.configure(
+            "Horizontal.TScrollbar",
+            background=PALETTE["panel"],
+            troughcolor=PALETTE["input_bg"],
+            bordercolor=PALETTE["border"],
+            arrowcolor=PALETTE["text_dim"],
+            gripcount=0,
+        )
+        self.style.map(
+            "Vertical.TScrollbar",
+            arrowcolor=[("active", PALETTE["text"]), ("disabled", PALETTE["text_disabled"])],
+        )
+        self.style.map(
+            "Horizontal.TScrollbar",
+            arrowcolor=[("active", PALETTE["text"]), ("disabled", PALETTE["text_disabled"])],
+        )
+
+        # ---------- Treeview (if you add tables later) ----------
+        self.style.configure(
+            "Treeview",
+            background=PALETTE["input_bg"],
+            fieldbackground=PALETTE["input_bg"],
+            foreground=PALETTE["text"],
+            bordercolor=PALETTE["border"],
+            rowheight=24,
+        )
+        self.style.map(
+            "Treeview",
+            background=[("selected", PALETTE["select_bg"])],
+            foreground=[("selected", PALETTE["select_fg"])],
+        )
+        self.style.configure(
+            "Treeview.Heading",
+            background=PALETTE["panel_2"],
+            foreground=PALETTE["text_dim"],
+            bordercolor=PALETTE["border"],
+            relief="flat",
+        )
+        self.style.map(
+            "Treeview.Heading",
+            background=[("active", PALETTE["tab_hover_bg"])],
+            foreground=[("active", PALETTE["text"])],
+        )
+
+        # ---------- Make tk.Text (LogView) match the palette ----------
+        # ttk styling won't affect tk.Text; LogView sets this explicitly if you want.
+        # We expose these so LogView can use them (optional).
+        self.root_set_text_defaults()
+
+    def root_set_text_defaults(self) -> None:
+        """
+        Optional: set Tk option database keys that help non-ttk widgets pick up colors.
+        LogView uses tk.Text directly; this improves visual consistency.
+        """
+        self.root.option_add("*Text.background", PALETTE["input_bg"])
+        self.root.option_add("*Text.foreground", PALETTE["text"])
+        self.root.option_add("*Text.insertBackground", PALETTE["caret"])
+        self.root.option_add("*Text.selectBackground", PALETTE["select_bg"])
+        self.root.option_add("*Text.selectForeground", PALETTE["select_fg"])
+
+--------------------------------------------------------------------------------
+FILE: ui_core\ui_app.py
+--------------------------------------------------------------------------------
+# src/ui_core/ui_app.py
+from __future__ import annotations
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
+
+from src.orchestration_core import AppController
+from src.orchestration_core.errors import ValidationError, NotRunningError
+
+from .theme import Theme
+from .log_sink import LogSink
+from .widgets.log_view import LogView
+from .tabs.base_tab import BaseTab
+from .tabs.placeholder_tab import PlaceholderTab
+from .tabs.registry import get_tab_classes
+
+
+class UiApp:
+    """
+    Tkinter UI Orchestrator:
+      - owns the root window + main layout
+      - owns the Notebook (tabs) and their lifecycle
+      - owns the LogView + drains threaded log sink
+      - pumps server output + logs + visible-tab refresh on a timer
+      - manages clean shutdown
+
+    Design rules:
+      - Tabs call AppController for actions and state
+      - Tabs write logs via log_fn (thread-safe)
+      - UiApp is the only place that owns the tick loop
+    """
+
+    def __init__(self, app_dir: Path):
+        self.app_dir = Path(app_dir).expanduser().resolve()
+
+        # Root
+        self.root = tk.Tk()
+        self.root.title("Server Manager")
+        self.root.geometry("1100x700")
+
+        # Logging (thread-safe)
+        self._log_sink = LogSink()
+        self.log_fn: Callable[[str], None] = self._log_sink.write
+
+        # Controller (UI-agnostic orchestration)
+        self.controller = AppController(self.app_dir, self.log_fn)
+
+        # Theme (minimal; swap later with your full dark theme)
+        Theme(self.root).apply()
+
+        # Layout widgets
+        self.main: Optional[ttk.Frame] = None
+        self.notebook: Optional[ttk.Notebook] = None
+        self.log_view: Optional[LogView] = None
+
+        # Tabs tracking
+        self._tabs: List[BaseTab] = []
+        self._tab_by_frame: Dict[str, BaseTab] = {}
+
+        # Tick loop config
+        self._tick_ms = 150
+        self._is_closing = False
+
+        # Build UI
+        self._build_layout()
+        self._build_tabs()
+
+        # Load config at startup
+        try:
+            self.controller.load_state()
+        except Exception as e:
+            self.log_fn(f"[ERROR] Failed to load config: {e}")
+
+        # Ensure background services are started (idempotent)
+        try:
+            self.controller.backups_start_scheduler()
+        except Exception as e:
+            self.log_fn(f"[ERROR] Failed to start backup scheduler: {e}")
+
+        # Event handlers
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Start pump loop
+        self._schedule_tick()
+
+    # -------------------------
+    # Layout + tabs
+    # -------------------------
+
+    def _build_layout(self) -> None:
+        self.main = ttk.Frame(self.root)
+        self.main.pack(fill="both", expand=True)
+
+        self.main.columnconfigure(0, weight=1)
+        self.main.rowconfigure(0, weight=3)
+        self.main.rowconfigure(1, weight=1)
+
+        self.notebook = ttk.Notebook(self.main)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+
+        self.log_view = LogView(self.main, max_lines=2500)
+        self.log_view.grid(row=1, column=0, sticky="nsew")
+
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _build_tabs(self) -> None:
+        assert self.notebook is not None
+
+        # Keep placeholder as "Home" only if you want it.
+        # It's useful during early scaffolding, but you can remove it later.
+        tab_classes: List[type[BaseTab]] = [PlaceholderTab] + get_tab_classes()
+
+        for tab_cls in tab_classes:
+            tab = tab_cls(self.controller, self.log_fn)
+            frame = tab.build(self.notebook)
+            self.notebook.add(frame, text=getattr(tab, "TAB_TITLE", "Tab"))
+            self._tabs.append(tab)
+
+            # map notebook tab id -> tab instance
+            self._tab_by_frame[str(frame)] = tab
+
+        # Trigger on_show for initial tab
+        self._fire_current_tab_on_show()
+
+    # -------------------------
+    # Events
+    # -------------------------
+
+    def _on_tab_changed(self, _event=None) -> None:
+        self._fire_current_tab_on_show()
+
+    def _fire_current_tab_on_show(self) -> None:
+        try:
+            assert self.notebook is not None
+            current = self.notebook.select()
+            tab = self._tab_by_frame.get(current)
+            if tab:
+                tab.on_show()
+        except Exception:
+            # never let UI fail because a tab hook errored
+            pass
+
+    # -------------------------
+    # Tick loop (pump)
+    # -------------------------
+
+    def _schedule_tick(self) -> None:
+        # Avoid scheduling after shutdown begins
+        if self._is_closing:
+            return
+        self.root.after(self._tick_ms, self._tick)
+
+    def _tick(self) -> None:
+        if self._is_closing:
+            return
+
+        # (1) Drain server output -> log sink
+        try:
+            out_lines = self.controller.poll_server_output(max_lines=200)
+            if out_lines:
+                for line in out_lines:
+                    self.log_fn(line)
+        except Exception as e:
+            self.log_fn(f"[ERROR] poll_server_output failed: {e}")
+
+        # (2) Drain buffered logs -> LogView
+        try:
+            lines = self._log_sink.drain(max_lines=500)
+            if lines:
+                assert self.log_view is not None
+                self.log_view.append_lines(lines)
+        except Exception:
+            # log view failures should not crash app
+            pass
+
+        # (3) Refresh visible tab
+        try:
+            assert self.notebook is not None
+            current = self.notebook.select()
+            tab = self._tab_by_frame.get(current)
+            if tab:
+                tab.refresh()
+        except Exception:
+            pass
+
+        self._schedule_tick()
+
+    # -------------------------
+    # Close behavior
+    # -------------------------
+
+    def _on_close(self) -> None:
+        if self._is_closing:
+            return
+        self._is_closing = True
+
+        # Optional: warn if server still running
+        try:
+            if self.controller.is_server_running():
+                choice = messagebox.askyesnocancel(
+                    "Server is running",
+                    "The server appears to still be running.\n\n"
+                    "Yes = Stop gracefully and exit\n"
+                    "No = Exit without stopping\n"
+                    "Cancel = Keep app open"
+                )
+                if choice is None:
+                    self._is_closing = False
+                    self._schedule_tick()
+                    return
+                if choice is True:
+                    try:
+                        self.controller.stop_server_graceful()
+                    except Exception as e:
+                        # If stop fails, ask if they still want to close
+                        still_close = messagebox.askyesno(
+                            "Stop failed",
+                            f"Graceful stop failed:\n{e}\n\nExit anyway?"
+                        )
+                        if not still_close:
+                            self._is_closing = False
+                            self._schedule_tick()
+                            return
+        except Exception:
+            # If any unexpected UI error occurs, continue shutdown.
+            pass
+
+        # Save state (best-effort)
+        try:
+            self.controller.save_state()
+        except Exception:
+            pass
+
+        # Stop scheduler (best-effort)
+        try:
+            self.controller.backups_stop_scheduler()
+        except Exception:
+            pass
+
+        # Finally close window
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    # -------------------------
+    # Public
+    # -------------------------
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+--------------------------------------------------------------------------------
+FILE: ui_core\__init__.py
+--------------------------------------------------------------------------------
+from .ui_app import UiApp
+from .tabs.base_tab import BaseTab
+
+__all__ = ["UiApp", "BaseTab"]
+
+
+--------------------------------------------------------------------------------
+FILE: ui_core\tabs\backup_tab.py
+--------------------------------------------------------------------------------
+# src/ui_core/tabs/backup_tab.py
+from __future__ import annotations
+
+import os
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from dataclasses import replace
+from pathlib import Path
+
+# Import compatibility: supports BOTH run modes:
+#   - python src/app.py        (no 'src.' prefix packages)
+#   - python -m src.app        ('src.' prefix packages)
+try:
+    from src.orchestration_core.errors import ValidationError
+    from src.server_manager_core.models import AppState
+except ModuleNotFoundError:  # fallback for non -m launch
+    from orchestration_core.errors import ValidationError
+    from server_manager_core.models import AppState
+
+from .base_tab import BaseTab
+
+
+class BackupsTab(BaseTab):
+    TAB_ID = "backups"
+    TAB_TITLE = "Backups"
+    ORDER = 20
+
+    def __init__(self, controller, log_fn):
+        super().__init__(controller, log_fn)
+
+        self.var_enabled = tk.BooleanVar(value=False)
+        self.var_backup_root = tk.StringVar()
+        self.var_interval = tk.StringVar()
+        self.var_retention = tk.StringVar()
+
+        # Snapshot browser
+        self._tree = None
+        self._tree_rows: dict[str, str] = {}  # iid -> zip_path
+
+        self._btn_apply = None
+        self._btn_refresh = None
+        self._btn_restore = None
+        self._btn_open_backup = None
+        self._btn_open_data = None
+
+        # prevent recursion when we programmatically adjust checkbox state
+        self._squelch_toggle = False
+
+    def build(self, parent):
+        self.frame = ttk.Frame(parent)
+
+        outer = ttk.Frame(self.frame)
+        outer.pack(fill="both", expand=True, padx=12, pady=12)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+
+        # -------------------------
+        # Settings
+        # -------------------------
+        box = ttk.LabelFrame(outer, text="Backup Settings")
+        box.grid(row=0, column=0, sticky="nsew")
+        box.columnconfigure(1, weight=1)
+
+        chk = ttk.Checkbutton(
+            box,
+            text="Enable scheduled backups",
+            variable=self.var_enabled,
+            command=self._on_toggle_enabled,
+        )
+        chk.grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(8, 6))
+
+        ttk.Label(box, text="Backup Folder:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(box, textvariable=self.var_backup_root).grid(row=1, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Button(box, text="Browse…", command=self._browse_backup_root).grid(row=1, column=2, sticky="e", padx=8, pady=6)
+
+        ttk.Label(box, text="Interval (minutes):").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(box, textvariable=self.var_interval, width=12).grid(row=2, column=1, sticky="w", padx=8, pady=6)
+
+        ttk.Label(box, text="Retention (days):").grid(row=3, column=0, sticky="w", padx=8, pady=(6, 8))
+        ttk.Entry(box, textvariable=self.var_retention, width=12).grid(row=3, column=1, sticky="w", padx=8, pady=(6, 8))
+
+        btn_row = ttk.Frame(box)
+        btn_row.grid(row=4, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 8))
+        btn_row.columnconfigure(0, weight=1)
+
+        self._btn_apply = ttk.Button(btn_row, text="Apply to Config", command=self._apply_to_state)
+        self._btn_apply.pack(side="left")
+
+        # -------------------------
+        # Snapshot Browser (Wave B2)
+        # -------------------------
+        vault = ttk.LabelFrame(outer, text="Snapshots")
+        vault.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        vault.columnconfigure(0, weight=1)
+        vault.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(vault)
+        top.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        top.columnconfigure(0, weight=1)
+
+        self._btn_refresh = ttk.Button(top, text="Refresh", command=self._refresh_snapshot_list)
+        self._btn_restore = ttk.Button(top, text="Restore Selected…", command=self._restore_selected)
+        self._btn_refresh.pack(side="left")
+        self._btn_restore.pack(side="left", padx=(10, 0))
+
+        columns = ("timestamp", "size", "filename")
+        self._tree = ttk.Treeview(vault, columns=columns, show="headings", selectmode="browse")
+        self._tree.heading("timestamp", text="Timestamp")
+        self._tree.heading("size", text="Size")
+        self._tree.heading("filename", text="Filename")
+
+        self._tree.column("timestamp", width=180, anchor="w")
+        self._tree.column("size", width=100, anchor="e")
+        self._tree.column("filename", width=480, anchor="w")
+
+        ysb = ttk.Scrollbar(vault, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=ysb.set)
+
+        self._tree.grid(row=1, column=0, sticky="nsew", padx=(8, 0), pady=(0, 8))
+        ysb.grid(row=1, column=1, sticky="ns", padx=(0, 8), pady=(0, 8))
+
+        # -------------------------
+        # Utilities
+        # -------------------------
+        util = ttk.LabelFrame(outer, text="Utilities")
+        util.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        util.columnconfigure(0, weight=1)
+
+        util_row = ttk.Frame(util)
+        util_row.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        util_row.columnconfigure(0, weight=1)
+
+        self._btn_open_backup = ttk.Button(util_row, text="Open Backup Folder", command=self._open_backup_folder)
+        self._btn_open_data = ttk.Button(util_row, text="Open Data Folder", command=self._open_data_folder)
+        self._btn_open_backup.pack(side="left")
+        self._btn_open_data.pack(side="left", padx=(10, 0))
+
+        # Initial fill
+        self._load_from_state()
+        self._refresh_snapshot_list()
+        return self.frame
+
+    # -------------------------
+    # Tab lifecycle
+    # -------------------------
+
+    def on_show(self) -> None:
+        self._load_from_state()
+        self._refresh_snapshot_list()
+
+    def refresh(self) -> None:
+        return
+
+    # -------------------------
+    # State sync
+    # -------------------------
+
+    def _load_from_state(self) -> None:
+        state = self.controller.get_state()
+        self._squelch_toggle = True
+        try:
+            self.var_enabled.set(bool(state.backups_enabled))
+        finally:
+            self._squelch_toggle = False
+
+        self.var_backup_root.set(state.backup_root or "")
+        self.var_interval.set(str(state.backup_interval_minutes))
+        self.var_retention.set(str(state.backup_retention_days))
+
+    def _apply_to_state(self) -> None:
+        """Commit UI fields into state and validate enabling via controller."""
+
+        def mut(s: AppState) -> AppState:
+            root = self.var_backup_root.get().strip()
+            try:
+                interval = int(self.var_interval.get().strip())
+            except Exception:
+                interval = s.backup_interval_minutes
+            try:
+                retention = int(self.var_retention.get().strip())
+            except Exception:
+                retention = s.backup_retention_days
+
+            return replace(
+                s,
+                backup_root=root,
+                backup_interval_minutes=interval,
+                backup_retention_days=retention,
+            )
+
+        new_state = self.controller.update_state(mut)
+
+        self.var_backup_root.set(new_state.backup_root or "")
+        self.var_interval.set(str(new_state.backup_interval_minutes))
+        self.var_retention.set(str(new_state.backup_retention_days))
+
+        want_enabled = bool(self.var_enabled.get())
+
+        try:
+            self.controller.set_backups_enabled(want_enabled)
+            self.controller.backups_start_scheduler()
+            self.log("[OK] Backup settings applied.")
+        except ValidationError as e:
+            self.log(f"[ERROR] Backup settings invalid: {e}")
+            messagebox.showerror("Invalid backup settings", str(e))
+
+            self._squelch_toggle = True
+            try:
+                self.var_enabled.set(False)
+            finally:
+                self._squelch_toggle = False
+
+            try:
+                self.controller.set_backups_enabled(False)
+            except Exception:
+                pass
+        except Exception as e:
+            self.log(f"[ERROR] Failed applying backup settings: {e}")
+            messagebox.showerror("Apply failed", str(e))
+
+        actual = bool(self.controller.get_state().backups_enabled)
+        self._squelch_toggle = True
+        try:
+            self.var_enabled.set(actual)
+        finally:
+            self._squelch_toggle = False
+
+        self._refresh_snapshot_list()
+
+    # -------------------------
+    # Snapshot Browser
+    # -------------------------
+
+    def _refresh_snapshot_list(self) -> None:
+        if not self._tree:
+            return
+
+        # Clear
+        for iid in self._tree.get_children(""):
+            self._tree.delete(iid)
+        self._tree_rows.clear()
+
+        state = self.controller.get_state()
+        backup_root = (state.backup_root or "").strip()
+        if not backup_root:
+            return
+
+        # Controller passthrough required:
+        #   list_backups() -> list[BackupInfo]
+        if not hasattr(self.controller, "list_backups"):
+            self.log("[ERROR] AppController missing list_backups(); cannot populate snapshot browser.")
+            return
+
+        try:
+            backups = self.controller.list_backups()
+        except Exception as e:
+            self.log(f"[ERROR] Failed listing backups: {e}")
+            return
+
+        for i, b in enumerate(backups):
+            # b may be dataclass with properties; be defensive
+            ts = getattr(b, "mtime_local", "")
+            size_bytes = int(getattr(b, "size_bytes", 0) or 0)
+            size_kib = size_bytes / 1024.0
+            filename = getattr(b, "filename", "")
+            path = getattr(b, "path", "")
+
+            iid = f"b{i}"
+            self._tree.insert("", "end", iid=iid, values=(ts, f"{size_kib:,.1f} KiB", filename))
+            self._tree_rows[iid] = path
+
+    def _restore_selected(self) -> None:
+        if not self._tree:
+            return
+        sel = self._tree.selection()
+        if not sel:
+            messagebox.showinfo("Restore", "Select a snapshot to restore.")
+            return
+
+        iid = sel[0]
+        zip_path = self._tree_rows.get(iid)
+        if not zip_path:
+            messagebox.showerror("Restore", "Selected snapshot path not found.")
+            return
+
+        state = self.controller.get_state()
+        if not state.data_path:
+            messagebox.showerror("Restore", "Data path is not set. Configure it in the Server tab first.")
+            return
+
+        # If server is running, block restore (controller refuses restore while running)
+        try:
+            if hasattr(self.controller, "is_server_running") and self.controller.is_server_running():
+                messagebox.showerror(
+                    "Server Running",
+                    "The server appears to be running.\n\n"
+                    "Stop the server first, then run the restore.",
+                )
+                return
+        except Exception:
+            pass
+
+        # Safety lock: typed confirmation
+        confirm = tk.Toplevel(self.frame)
+        confirm.title("Confirm Restore")
+        confirm.geometry("520x220")
+        confirm.transient(self.frame.winfo_toplevel())
+        confirm.grab_set()
+
+        ttk.Label(confirm, text="Point-in-time Restore (Safety Lock)", style="Heading.TLabel").pack(anchor="w", padx=12, pady=(12, 6))
+        msg = (
+            "This will rename the current save folder to a .bak_<timestamp> folder\n"
+            "and then extract the selected snapshot.\n\n"
+            "Type RESTORE to confirm."
+        )
+        ttk.Label(confirm, text=msg).pack(anchor="w", padx=12)
+
+        var = tk.StringVar()
+        entry = ttk.Entry(confirm, textvariable=var)
+        entry.pack(fill="x", padx=12, pady=(10, 6))
+        entry.focus_set()
+
+        btns = ttk.Frame(confirm)
+        btns.pack(fill="x", padx=12, pady=(6, 12))
+        btns.columnconfigure(0, weight=1)
+
+        def do_restore():
+            if var.get().strip().upper() != "RESTORE":
+                messagebox.showerror("Confirm", "Type RESTORE to proceed.")
+                return
+
+            if not hasattr(self.controller, "restore_backup"):
+                messagebox.showerror("Restore", "AppController missing restore_backup(); cannot restore.")
+                self.log("[ERROR] AppController missing restore_backup().")
+                confirm.destroy()
+                return
+
+            try:
+                self.controller.restore_backup(zip_path)
+                self.log(f"[OK] Restore requested: {zip_path}")
+            except Exception as e:
+                self.log(f"[ERROR] Restore failed: {e}")
+                messagebox.showerror("Restore failed", str(e))
+            finally:
+                confirm.destroy()
+                self._refresh_snapshot_list()
+
+        ttk.Button(btns, text="Cancel", command=confirm.destroy).pack(side="right")
+        ttk.Button(btns, text="Restore", command=do_restore).pack(side="right", padx=(0, 10))
+
+    # -------------------------
+    # UI actions
+    # -------------------------
+
+    def _on_toggle_enabled(self) -> None:
+        if self._squelch_toggle:
+            return
+        self._apply_to_state()
+
+    def _browse_backup_root(self) -> None:
+        initial = self.var_backup_root.get().strip()
+        init_dir = initial if initial else str(Path.cwd())
+        path = filedialog.askdirectory(title="Select Backup Folder", initialdir=init_dir)
+        if path:
+            self.var_backup_root.set(path)
+            self._apply_to_state()
+
+    def _open_backup_folder(self) -> None:
+        try:
+            self.controller.open_backup_folder()
+        except Exception as e:
+            self.log(f"[ERROR] Could not open backup folder: {e}")
+            messagebox.showerror("Open failed", str(e))
+
+    def _open_data_folder(self) -> None:
+        try:
+            self.controller.open_data_folder()
+        except Exception as e:
+            self.log(f"[ERROR] Could not open data folder: {e}")
+            messagebox.showerror("Open failed", str(e))
+
+
+
+--------------------------------------------------------------------------------
+FILE: ui_core\tabs\base_tab.py
+--------------------------------------------------------------------------------
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Callable, Optional
+
+from src.orchestration_core import AppController
+
+
+class BaseTab(ABC):
+    """
+    Contract for modular tabs.
+
+    build(parent) -> returns frame
+    refresh() -> called periodically by UiApp (optional)
+    """
+
+    TAB_ID: str = "base"
+    TAB_TITLE: str = "Base"
+    ORDER: int = 100
+
+    def __init__(self, controller: AppController, log_fn: Callable[[str], None]):
+        self.controller = controller
+        self.log = log_fn
+        self.frame = None  # assigned by build()
+
+    @abstractmethod
+    def build(self, parent):
+        raise NotImplementedError
+
+    def on_show(self) -> None:
+        """Called when tab becomes visible (optional)."""
+        return
+
+    def refresh(self) -> None:
+        """Called by UiApp timer (optional)."""
+        return
+
+
+--------------------------------------------------------------------------------
+FILE: ui_core\tabs\placeholder_tab.py
+--------------------------------------------------------------------------------
+from __future__ import annotations
+
+from tkinter import ttk
+
+from .base_tab import BaseTab
+
+
+class PlaceholderTab(BaseTab):
+    TAB_ID = "placeholder"
+    TAB_TITLE = "Home"
+    ORDER = 0
+
+    def build(self, parent):
+        self.frame = ttk.Frame(parent)
+        lbl = ttk.Label(
+            self.frame,
+            text="UI scaffold is live.\nAdd tab modules under ui_core/tabs and register them in registry.py.",
+            justify="left"
+        )
+        lbl.pack(anchor="w", padx=12, pady=12)
+
+        btn_row = ttk.Frame(self.frame)
+        btn_row.pack(fill="x", padx=12, pady=(0, 12))
+
+        ttk.Button(btn_row, text="Load Config", command=self._load).pack(side="left")
+        ttk.Button(btn_row, text="Save Config", command=self._save).pack(side="left", padx=(8, 0))
+
+        return self.frame
+
+    def _load(self):
+        self.controller.load_state()
+
+    def _save(self):
+        self.controller.save_state()
+
+
+--------------------------------------------------------------------------------
+FILE: ui_core\tabs\registry.py
+--------------------------------------------------------------------------------
+# src/ui_core/tabs/registry.py
+from __future__ import annotations
+
+from .base_tab import BaseTab
+from .server_tab import ServerTab
+from .backup_tab import BackupsTab
+
+def get_tab_classes() -> list[type[BaseTab]]:
+    """Central place to register tabs."""
+    tabs: list[type[BaseTab]] = [
+        ServerTab,
+        BackupsTab,
+    ]
+
+    return sorted(tabs, key=lambda t: getattr(t, "ORDER", 100))
+
+
+--------------------------------------------------------------------------------
+FILE: ui_core\tabs\server_tab.py
+--------------------------------------------------------------------------------
+# src/ui_core/tabs/server_tab.py
+from __future__ import annotations
+
+import os
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from dataclasses import replace
+from pathlib import Path
+
+from src.orchestration_core.errors import ValidationError, NotRunningError
+from src.server_manager_core.models import AppState
+from .base_tab import BaseTab
+
+
+class ServerTab(BaseTab):
+    TAB_ID = "server"
+    TAB_TITLE = "Server"
+    ORDER = 10
+
+    def __init__(self, controller, log_fn):
+        super().__init__(controller, log_fn)
+
+        # Tk variables (initialized in build())
+        self.var_exe = tk.StringVar()
+        self.var_data = tk.StringVar()
+        self.var_port = tk.StringVar()
+
+        self.var_running = tk.StringVar(value="Unknown")
+        self.var_listening = tk.StringVar(value="Unknown")
+
+        self.var_cmd = tk.StringVar()
+
+        # Widgets we update later
+        self._btn_start = None
+        self._btn_stop = None
+        self._btn_force = None
+        self._btn_kill = None
+        self._btn_send = None
+
+    # -------------------------
+    # Build
+    # -------------------------
+
+    def build(self, parent):
+        self.frame = ttk.Frame(parent)
+
+        outer = ttk.Frame(self.frame)
+        outer.pack(fill="both", expand=True, padx=12, pady=12)
+        outer.columnconfigure(0, weight=1)
+
+        # --- Paths / settings ---
+        paths = ttk.LabelFrame(outer, text="Server Settings")
+        paths.grid(row=0, column=0, sticky="nsew")
+        paths.columnconfigure(1, weight=1)
+
+        # Executable
+        ttk.Label(paths, text="Server EXE:").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        exe_entry = ttk.Entry(paths, textvariable=self.var_exe)
+        exe_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
+        ttk.Button(paths, text="Browse…", command=self._browse_exe).grid(row=0, column=2, sticky="e", padx=8, pady=(8, 4))
+
+        # Data path
+        ttk.Label(paths, text="Data Path:").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        data_entry = ttk.Entry(paths, textvariable=self.var_data)
+        data_entry.grid(row=1, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Button(paths, text="Browse…", command=self._browse_data_dir).grid(row=1, column=2, sticky="e", padx=8, pady=4)
+
+        # Port
+        ttk.Label(paths, text="Port:").grid(row=2, column=0, sticky="w", padx=8, pady=(4, 8))
+        port_entry = ttk.Entry(paths, textvariable=self.var_port, width=12)
+        port_entry.grid(row=2, column=1, sticky="w", padx=8, pady=(4, 8))
+        ttk.Button(paths, text="Apply to Config", command=self._apply_to_state).grid(row=2, column=2, sticky="e", padx=8, pady=(4, 8))
+
+        # --- Status + Actions ---
+        status = ttk.LabelFrame(outer, text="Status & Controls")
+        status.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        status.columnconfigure(0, weight=1)
+        status.columnconfigure(1, weight=1)
+
+        # Status display
+        left = ttk.Frame(status)
+        left.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        left.columnconfigure(1, weight=1)
+
+        ttk.Label(left, text="Server Running:").grid(row=0, column=0, sticky="w")
+        ttk.Label(left, textvariable=self.var_running).grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        ttk.Label(left, text="Port Listening (localhost):").grid(row=1, column=0, sticky="w")
+        ttk.Label(left, textvariable=self.var_listening).grid(row=1, column=1, sticky="w", padx=(8, 0))
+
+        # Buttons
+        right = ttk.Frame(status)
+        right.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
+
+        self._btn_start = ttk.Button(right, text="Start Server", command=self._start_server)
+        self._btn_stop = ttk.Button(right, text="Stop (Graceful)", command=self._stop_graceful)
+        self._btn_force = ttk.Button(right, text="Stop (Force)", command=self._stop_force)
+        self._btn_kill = ttk.Button(right, text="Kill", command=self._kill)
+
+        self._btn_start.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self._btn_stop.grid(row=1, column=0, sticky="ew", pady=6)
+        self._btn_force.grid(row=2, column=0, sticky="ew", pady=6)
+        self._btn_kill.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+
+        for i in range(4):
+            right.rowconfigure(i, weight=0)
+        right.columnconfigure(0, weight=1)
+
+        # --- Command line ---
+        cmd = ttk.LabelFrame(outer, text="Console Command")
+        cmd.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        cmd.columnconfigure(0, weight=1)
+
+        cmd_row = ttk.Frame(cmd)
+        cmd_row.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        cmd_row.columnconfigure(0, weight=1)
+
+        cmd_entry = ttk.Entry(cmd_row, textvariable=self.var_cmd)
+        cmd_entry.grid(row=0, column=0, sticky="ew")
+        self._btn_send = ttk.Button(cmd_row, text="Send", command=self._send_command)
+        self._btn_send.grid(row=0, column=1, padx=(8, 0))
+
+        # Bind Enter to send
+        cmd_entry.bind("<Return>", lambda _e: self._send_command())
+
+        # Initial fill from state
+        self._load_from_state()
+
+        return self.frame
+
+    # -------------------------
+    # Tab lifecycle
+    # -------------------------
+
+    def on_show(self) -> None:
+        # Ensure UI reflects current state when switching to this tab
+        self._load_from_state()
+        self._refresh_status()
+
+    def refresh(self) -> None:
+        # Called by UiApp tick for visible tab
+        self._refresh_status()
+
+    # -------------------------
+    # State sync
+    # -------------------------
+
+    def _load_from_state(self) -> None:
+        state = self.controller.get_state()
+        self.var_exe.set(state.server_exe_path or "")
+        self.var_data.set(state.data_path or "")
+        self.var_port.set(str(state.port))
+
+    def _apply_to_state(self) -> None:
+        """
+        Commit current UI fields into state (does not automatically save to disk).
+        """
+        def mut(s: AppState) -> AppState:
+            exe = self.var_exe.get().strip()
+            data = self.var_data.get().strip()
+            port_txt = self.var_port.get().strip()
+
+            # Keep port conservative: if invalid, keep old value but warn.
+            try:
+                port_val = int(port_txt)
+            except Exception:
+                port_val = s.port
+
+            return replace(
+                s,
+                server_exe_path=exe,
+                data_path=data,
+                port=port_val,
+            )
+
+        new_state = self.controller.update_state(mut)
+        self.log("[OK] Applied UI fields to state.")
+        # Helpful: if port parse failed, correct the entry to current stored value
+        self.var_port.set(str(new_state.port))
+
+    # -------------------------
+    # Browse helpers
+    # -------------------------
+
+    def _browse_exe(self) -> None:
+        initial = self.var_exe.get().strip()
+        init_dir = str(Path(initial).parent) if initial else str(Path.cwd())
+        path = filedialog.askopenfilename(
+            title="Select Vintage Story Server Executable",
+            initialdir=init_dir,
+            filetypes=[("Executable", "*.exe"), ("All Files", "*.*")]
+        )
+        if path:
+            self.var_exe.set(path)
+            self._apply_to_state()
+
+    def _browse_data_dir(self) -> None:
+        initial = self.var_data.get().strip()
+        init_dir = initial if initial else str(Path.cwd())
+        path = filedialog.askdirectory(
+            title="Select Vintage Story Data Folder",
+            initialdir=init_dir,
+        )
+        if path:
+            self.var_data.set(path)
+            self._apply_to_state()
+
+    # -------------------------
+    # Actions
+    # -------------------------
+
+    def _start_server(self) -> None:
+        try:
+            self._apply_to_state()
+            self.controller.start_server()
+            self.log("[OK] Start requested.")
+        except ValidationError as e:
+            self._show_error("Cannot start server", str(e))
+        except Exception as e:
+            self._show_error("Start failed", str(e))
+        finally:
+            self._refresh_status()
+
+    def _stop_graceful(self) -> None:
+        try:
+            self.controller.stop_server_graceful()
+            self.log("[OK] Graceful stop requested.")
+        except NotRunningError as e:
+            self._show_info("Server not running", str(e))
+        except Exception as e:
+            self._show_error("Stop failed", str(e))
+        finally:
+            self._refresh_status()
+
+    def _stop_force(self) -> None:
+        try:
+            self.controller.stop_server_force()
+            self.log("[WARN] Force stop requested.")
+        except NotRunningError as e:
+            self._show_info("Server not running", str(e))
+        except Exception as e:
+            self._show_error("Force stop failed", str(e))
+        finally:
+            self._refresh_status()
+
+    def _kill(self) -> None:
+        if not messagebox.askyesno("Kill Server", "Kill the server process immediately?"):
+            return
+        try:
+            self.controller.kill_server()
+            self.log("[WARN] Kill requested.")
+        except NotRunningError as e:
+            self._show_info("Server not running", str(e))
+        except Exception as e:
+            self._show_error("Kill failed", str(e))
+        finally:
+            self._refresh_status()
+
+    def _send_command(self) -> None:
+        cmd = self.var_cmd.get().strip()
+        if not cmd:
+            return
+        try:
+            self.controller.send_server_command(cmd)
+            self.log(f"[CMD] {cmd}")
+            self.var_cmd.set("")
+        except NotRunningError as e:
+            self._show_info("Server not running", str(e))
+        except Exception as e:
+            self._show_error("Send command failed", str(e))
+
+    # -------------------------
+    # Status
+    # -------------------------
+
+    def _refresh_status(self) -> None:
+        running = self.controller.is_server_running()
+        self.var_running.set("Yes" if running else "No")
+
+        # Port listening check (localhost)
+        try:
+            listening = self.controller.is_port_listening_localhost()
+            self.var_listening.set("Yes" if listening else "No")
+        except Exception:
+            self.var_listening.set("Unknown")
+
+        # Button states
+        if self._btn_start and self._btn_stop and self._btn_force and self._btn_kill and self._btn_send:
+            if running:
+                self._btn_start.configure(state="disabled")
+                self._btn_stop.configure(state="normal")
+                self._btn_force.configure(state="normal")
+                self._btn_kill.configure(state="normal")
+                self._btn_send.configure(state="normal")
+            else:
+                self._btn_start.configure(state="normal")
+                self._btn_stop.configure(state="disabled")
+                self._btn_force.configure(state="disabled")
+                self._btn_kill.configure(state="disabled")
+                self._btn_send.configure(state="disabled")
+
+    # -------------------------
+    # UI messaging
+    # -------------------------
+
+    def _show_error(self, title: str, msg: str) -> None:
+        self.log(f"[ERROR] {title}: {msg}")
+        messagebox.showerror(title, msg)
+
+    def _show_info(self, title: str, msg: str) -> None:
+        self.log(f"[INFO] {title}: {msg}")
+        messagebox.showinfo(title, msg)
+
+
+--------------------------------------------------------------------------------
+FILE: ui_core\widgets\log_view.py
+--------------------------------------------------------------------------------
+from __future__ import annotations
+
+import tkinter as tk
+from tkinter import ttk
+
+
+class LogView(ttk.Frame):
+    def __init__(self, parent, *, max_lines: int = 2000):
+        super().__init__(parent)
+        self._max_lines = max_lines
+        self._line_count = 0
+
+        self.text = tk.Text(self, height=12, wrap="none")
+        self.text.configure(state="disabled")
+
+        yscroll = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=yscroll.set)
+
+        self.text.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+    def append_lines(self, lines: list[str]) -> None:
+        if not lines:
+            return
+
+        self.text.configure(state="normal")
+        for line in lines:
+            self.text.insert("end", line + "\n")
+            self._line_count += 1
+
+        # Trim oldest lines if too many
+        if self._line_count > self._max_lines:
+            trim = self._line_count - self._max_lines
+            # delete first N lines
+            self.text.delete("1.0", f"{trim + 1}.0")
+            self._line_count = self._max_lines
+
+        self.text.see("end")
+        self.text.configure(state="disabled")
+

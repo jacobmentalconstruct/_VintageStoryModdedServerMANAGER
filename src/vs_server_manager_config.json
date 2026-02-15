@@ -1,0 +1,11 @@
+{
+  "server_exe_path": "",
+  "data_path": "",
+  "port": 42420,
+  "backup_root": "",
+  "backup_interval_minutes": 60,
+  "backup_retention_days": 7,
+  "backups_enabled": false,
+  "last_started_at": "",
+  "last_backup_at": ""
+}
