@@ -1,16 +1,19 @@
-import os
 import shutil
 import zipfile
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Optional
 
 @dataclass
 class ModInfo:
     filename: str
     path: str
     size_bytes: int
+    side: str = "Unknown"  # 'Client', 'Server', 'Both'
     is_enabled: bool = True
+    # For online mods
+    modid: int = 0
+    download_url: str = ""
 
 class ModManager:
     def __init__(self, log_fn):
@@ -20,27 +23,56 @@ class ModManager:
         """Scans the /Mods folder in the Vintage Story data directory."""
         mods_dir = Path(data_path).expanduser().resolve() / "Mods"
         if not mods_dir.exists():
-            self.log(f"[WARN] Mods directory not found at: {mods_dir}")
             return []
 
         mod_list = []
-        # Vintage Story mods are typically .zip or .dll files
         for item in mods_dir.glob("*.*"):
             if item.suffix.lower() in [".zip", ".dll"]:
                 mod_list.append(ModInfo(
                     filename=item.name,
                     path=str(item),
-                    size_bytes=item.stat().st_size
+                    size_bytes=item.stat().st_size,
+                    side="Local" 
                 ))
         
-        # Sort alphabetically for the UI
         return sorted(mod_list, key=lambda x: x.filename.lower())
 
+    def parse_api_response(self, json_data: dict) -> List[ModInfo]:
+        """Converts raw API JSON into ModInfo objects."""
+        if not json_data or "mods" not in json_data:
+            return []
+        
+        results = []
+        for m in json_data["mods"]:
+            try:
+                name = m.get("name", "Unknown")
+                modid = m.get("modid", 0)
+                # API 'side': "both", "client", "server"
+                raw_side = m.get("side", "both")
+                
+                # Try to get the latest file URL
+                url = "" 
+                if "lastrelease" in m and m["lastrelease"]:
+                    url = m["lastrelease"].get("mainfile", "")
+
+                if not url:
+                    continue # Skip mods with no download
+
+                results.append(ModInfo(
+                    filename=name,
+                    path="",
+                    size_bytes=0,
+                    side=str(raw_side).title(),
+                    modid=modid,
+                    download_url=url
+                ))
+            except Exception:
+                continue
+                
+        return sorted(results, key=lambda x: x.filename)
+
     def create_client_bundle(self, data_path: str, export_root: str, profile_name: str) -> Optional[Path]:
-        """
-        Zips all current mods into a single package for players to download.
-        Saves to <backup_root>/ModExports/
-        """
+        """Zips mods into a single package."""
         mods_source = Path(data_path).expanduser().resolve() / "Mods"
         export_dir = Path(export_root).expanduser().resolve() / "ModExports"
         
@@ -62,26 +94,3 @@ class ModManager:
         except Exception as e:
             self.log(f"[ERROR] Failed to create mod bundle: {e}")
             return None
-
-    def apply_mod_profile(self, target_data_path: str, profile_mods: List[str], storage_repository: str):
-        """
-        Future Logic: Copy specific mods from a 'master repository' 
-        into the active server 'Mods' folder.
-        """
-        target_dir = Path(target_data_path).expanduser().resolve() / "Mods"
-        repo_dir = Path(storage_repository).expanduser().resolve()
-        
-        if not repo_dir.exists():
-            self.log(f"[ERROR] Mod repository not found: {repo_dir}")
-            return
-
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        for mod_name in profile_mods:
-            src = repo_dir / mod_name
-            dest = target_dir / mod_name
-            if src.exists():
-                shutil.copy2(src, dest)
-                self.log(f"[INFO] Applied mod: {mod_name}")
-            else:
-                self.log(f"[WARN] Mod {mod_name} not found in repository.")

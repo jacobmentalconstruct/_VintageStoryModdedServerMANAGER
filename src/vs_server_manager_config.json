@@ -6,6 +6,8 @@
   "backup_interval_minutes": 60,
   "backup_retention_days": 7,
   "backups_enabled": false,
+  "world_settings": {},
+  "mod_profiles": {},
   "last_started_at": "",
   "last_backup_at": ""
 }

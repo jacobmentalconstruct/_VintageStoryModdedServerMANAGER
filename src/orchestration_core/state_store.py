@@ -1,38 +1,32 @@
 from __future__ import annotations
-
 import threading
 from copy import deepcopy
-from typing import Callable
+from typing import Callable, TypeVar, Generic
 
-from src.server_manager_core.models import AppState
+T = TypeVar("T")
 
-
-class StateStore:
+class StateStore(Generic[T]):
     """
-    Holds the live AppState + provides thread-safe get/set/update.
-    - UI and background threads (backup scheduler / server output pump) may both touch state.
-    - We store a private copy; get() returns a deepcopy so callers can't mutate without set/update.
+    Thread-safe container for immutable application state.
+    Uses RLock to allow re-entrant access if needed.
     """
-
-    def __init__(self, initial: AppState | None = None):
+    def __init__(self, initial_state: T):
+        self._state = initial_state
         self._lock = threading.RLock()
-        self._state = initial if initial is not None else AppState()
 
-    def get(self) -> AppState:
+    def get_state(self) -> T:
+        """Returns a deep copy of the current state to prevent race conditions."""
         with self._lock:
             return deepcopy(self._state)
 
-    def set(self, new_state: AppState) -> None:
-        with self._lock:
-            self._state = deepcopy(new_state)
-
-    def update(self, fn: Callable[[AppState], AppState]) -> AppState:
+    def update(self, transform: Callable[[T], T]) -> None:
         """
-        Apply fn to a mutable copy of state, store the result, return stored copy.
+        Applies a transformation function to the state safely.
+        The transform function receives a copy of the current state
+        and must return the new state (e.g., using dataclasses.replace).
         """
         with self._lock:
-            draft = deepcopy(self._state)
-            updated = fn(draft)
-            self._state = deepcopy(updated)
-            return deepcopy(self._state)
-
+            # Pass a copy to the transform function to ensure isolation
+            current = deepcopy(self._state)
+            new_state = transform(current)
+            self._state = new_state

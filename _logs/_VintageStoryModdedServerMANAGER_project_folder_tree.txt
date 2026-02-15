@@ -1,0 +1,48 @@
+Project Tree: C:\Jacob\Scripts\_VintageStoryModdedServerMANAGER
+Generated: 2026-02-14 19:36:50.833084
+
+├── 📁 src/
+│   ├── 📁 orchestration_core/
+│   │   ├── 📄 __init__.py
+│   │   ├── 📄 app_controller.py
+│   │   ├── 📄 errors.py
+│   │   ├── 📄 state_store.py
+│   │   └── 📄 validators.py
+│   ├── 📁 server_manager_core/
+│   │   ├── 📄 __init__.py
+│   │   ├── 📄 backup_manager.py
+│   │   ├── 📄 config_store.py
+│   │   ├── 📄 constants.py
+│   │   ├── 📄 mod_manager.py
+│   │   ├── 📄 models.py
+│   │   ├── 📄 network_client.py
+│   │   ├── 📄 port_checker.py
+│   │   └── 📄 server_process.py
+│   ├── 📁 ui_core/
+│   │   ├── 📁 tabs/
+│   │   │   ├── 📄 backup_tab.py
+│   │   │   ├── 📄 base_tab.py
+│   │   │   ├── 📄 dashboard_tab.py
+│   │   │   ├── 📄 mods_tab.py
+│   │   │   ├── 📄 player_tab.py
+│   │   │   ├── 📄 registry.py
+│   │   │   ├── 📄 server_tab.py
+│   │   │   └── 📄 world_tab.py
+│   │   ├── 📁 widgets/
+│   │   │   └── 📄 log_view.py
+│   │   ├── 📄 __init__.py
+│   │   ├── 📄 log_sink.py
+│   │   ├── 📄 theme.py
+│   │   └── 📄 ui_app.py
+│   ├── 📄 __init__.py
+│   ├── 📄 app.py
+│   └── 📄 vs_server_manager_config.json
+├── 📁 tools/
+│   └── 📄 repair_imports.py
+├── 📄 .gitignore
+├── 📄 _VintageStoryModdedServerMANAGER.7z
+├── 📄 LICENSE.md
+├── 📄 README.md
+├── 📄 requirements.txt
+├── 📄 setup_env.bat
+└── 📄 start.bat
