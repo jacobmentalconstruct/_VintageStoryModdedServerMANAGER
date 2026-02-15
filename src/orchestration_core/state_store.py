@@ -19,14 +19,14 @@ class StateStore(Generic[T]):
         with self._lock:
             return deepcopy(self._state)
 
-    def update(self, transform: Callable[[T], T]) -> None:
+    def update(self, transform: Callable[[T], T]) -> T:
         """
         Applies a transformation function to the state safely.
-        The transform function receives a copy of the current state
-        and must return the new state (e.g., using dataclasses.replace).
+        Returns the NEW state.
         """
         with self._lock:
             # Pass a copy to the transform function to ensure isolation
             current = deepcopy(self._state)
             new_state = transform(current)
             self._state = new_state
+            return new_state

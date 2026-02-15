@@ -72,8 +72,9 @@ class AppController:
     def get_state(self) -> AppState:
         return self._store.get_state()
 
-    def update_state(self, transform: Callable[[AppState], AppState]) -> None:
-        self._store.update(transform)
+    def update_state(self, transform: Callable[[AppState], AppState]) -> AppState:
+        # BUG FIX: Return the result of the store update to the UI
+        return self._store.update(transform)
 
     def load_state(self) -> None:
         try:
@@ -221,11 +222,6 @@ class AppController:
     def restore_backup(self, zip_path: str) -> None:
         """
         Wave B: Point-in-time restore.
-
-        Policy:
-          - Requires data_path
-          - Restores into <data_path>/Saves
-          - If the server is running, refuse (UI should stop server first)
         """
         state = self.get_state()
         if not state.data_path:
@@ -303,7 +299,10 @@ class AppController:
     def update_world_settings(self, new_settings: dict) -> None:
         """Updates the AppState with new world generation parameters."""
         validate_world_gen_settings(new_settings)
+        # 1. Update Memory
         self.update_state(lambda s: replace(s, world_settings=new_settings))
+        # 2. Persist to Disk (Added Fix)
+        self.save_state()
         self._log("[OK] World generation settings updated in state.")
 
     # -------------------------

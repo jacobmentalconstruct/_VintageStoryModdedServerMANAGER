@@ -67,19 +67,13 @@ class ModManager:
                 else:
                     tags = []
 
-                # URL Logic - The "Aggressive" Update
+                # URL Logic
                 url = ""
                 if "lastrelease" in m and m["lastrelease"]:
                     rel = m["lastrelease"]
-                    
-                    # 1. Try the nice field
                     url = rel.get("mainfile", "")
-                    
-                    # 2. If empty or doesn't start with http, construct it manually
-                    if not url or not url.startswith("http"):
-                        if "fileid" in rel:
-                            # This is the standard VS Mod DB download format
-                            url = f"https://mods.vintagestory.at/files/asset/{rel['fileid']}"
+                    if not url and "fileid" in rel:
+                        url = f"https://mods.vintagestory.at/files/asset/{rel['fileid']}"
                 
                 # Add to results
                 results.append(ModInfo(
