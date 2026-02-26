@@ -25,8 +25,8 @@ class StateStore(Generic[T]):
         Returns the NEW state.
         """
         with self._lock:
-            # Pass a copy to the transform function to ensure isolation
             current = deepcopy(self._state)
             new_state = transform(current)
             self._state = new_state
+            # CRITICAL FIX: Return the new state so the UI knows what happened
             return new_state

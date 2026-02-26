@@ -234,15 +234,72 @@ if __name__ == "__main__":
 FILE: src\vs_server_manager_config.json
 --------------------------------------------------------------------------------
 {
-  "server_exe_path": "",
-  "data_path": "",
+  "server_exe_path": "C:/Users/jacob/AppData/Roaming/Vintagestory/VintagestoryServer.exe",
+  "data_path": "C:/Jacob/Servers/VintageStory/CasualKilla420AndRaithe",
   "port": 42420,
   "backup_root": "",
   "backup_interval_minutes": 60,
   "backup_retention_days": 7,
   "backups_enabled": false,
-  "world_settings": {},
-  "mod_profiles": {},
+  "world_settings": {
+    "WorldName": "NewWorld",
+    "Seed": "",
+    "WorldWidth": 1024000,
+    "WorldHeight": 320,
+    "SeaLevel": 0.556734693877551,
+    "Landcover": 0.6066666666666667,
+    "UpheavalRate": 1.5578231292517006,
+    "GlobalDepositSpawnRate": 1.7,
+    "SurfaceCopperDepositFrequency": "common",
+    "SurfaceTinDepositFrequency": "rare",
+    "GameMode": "survival",
+    "GraceTimer": 4,
+    "DeathPunishment": "dropall",
+    "HungerRate": 1.090888382687927,
+    "BlockGravity": "sandgravel",
+    "MicroblockChiseling": 2,
+    "ClassExclusiveRecipes": true,
+    "ToolDurability": 1.115717539863326,
+    "TemporalStability": true,
+    "TemporalStorms": "sometimes",
+    "TemporalRifts": "visible",
+    "SleepDuringStorms": false,
+    "ExtraConfig": {
+      "AllowUndergroundFarming": true,
+      "ShipSpeedMultiplier": 1.25,
+      "CreatureStrength": 1.1,
+      "LungCapacity": 60
+    }
+  },
+  "mod_profiles": {
+    "server-mods": [
+      "ACulinaryArtillery-v1.2.3-vinterra.zip",
+      "backpacks_0.0.1.zip",
+      "BetterRuinsv0.6.0-pre.1.zip",
+      "CarryOn-1.21.0_v1.12.2.zip",
+      "combatoverhaul_0.16.4.zip",
+      "CommonLib_VS1.21.1_net8_v2.8.0.zip",
+      "DSBv1.0.05.zip",
+      "dungeonsandshafts_2.2.3.zip",
+      "ExpandedFoods 1.7.4.zip",
+      "FeverstoneWilds-v1.4.5-1.18.15.zip",
+      "floatingfish_1.1.7.zip",
+      "FromGoldenCombs-1.21-v1.9.4.zip",
+      "joyofsailing_1.4.0.zip",
+      "LoP-Mosa-1.0.14.zip",
+      "necessaries_v1.17.1-1.1.3.zip",
+      "nomadtents_101.zip",
+      "npcs_0.3.2.zip",
+      "primitivesurvival_4.0.3.zip",
+      "ProspectorInfo-4.3.0.zip",
+      "qptech1.15.4.zip",
+      "SaltAndSands-1.1.6.zip",
+      "TeleportationNetwork_VS1.19.8_net7_v1.14.4.zip",
+      "th3dungeon_0.4.5.zip",
+      "vsvillage_v3.0.1.zip",
+      "xskills_v0.8.19.zip"
+    ]
+  },
   "last_started_at": "",
   "last_backup_at": ""
 }
@@ -328,8 +385,9 @@ class AppController:
     def get_state(self) -> AppState:
         return self._store.get_state()
 
-    def update_state(self, transform: Callable[[AppState], AppState]) -> None:
-        self._store.update(transform)
+    def update_state(self, transform: Callable[[AppState], AppState]) -> AppState:
+        # BUG FIX: Return the result of the store update to the UI
+        return self._store.update(transform)
 
     def load_state(self) -> None:
         try:
@@ -477,11 +535,6 @@ class AppController:
     def restore_backup(self, zip_path: str) -> None:
         """
         Wave B: Point-in-time restore.
-
-        Policy:
-          - Requires data_path
-          - Restores into <data_path>/Saves
-          - If the server is running, refuse (UI should stop server first)
         """
         state = self.get_state()
         if not state.data_path:
@@ -559,7 +612,10 @@ class AppController:
     def update_world_settings(self, new_settings: dict) -> None:
         """Updates the AppState with new world generation parameters."""
         validate_world_gen_settings(new_settings)
+        # 1. Update Memory
         self.update_state(lambda s: replace(s, world_settings=new_settings))
+        # 2. Persist to Disk (Added Fix)
+        self.save_state()
         self._log("[OK] World generation settings updated in state.")
 
     # -------------------------
@@ -607,17 +663,17 @@ class StateStore(Generic[T]):
         with self._lock:
             return deepcopy(self._state)
 
-    def update(self, transform: Callable[[T], T]) -> None:
+    def update(self, transform: Callable[[T], T]) -> T:
         """
         Applies a transformation function to the state safely.
-        The transform function receives a copy of the current state
-        and must return the new state (e.g., using dataclasses.replace).
+        Returns the NEW state.
         """
         with self._lock:
             # Pass a copy to the transform function to ensure isolation
             current = deepcopy(self._state)
             new_state = transform(current)
             self._state = new_state
+            return new_state
 --------------------------------------------------------------------------------
 FILE: src\orchestration_core\validators.py
 --------------------------------------------------------------------------------
@@ -936,8 +992,9 @@ FILE: src\server_manager_core\mod_manager.py
 --------------------------------------------------------------------------------
 import shutil
 import zipfile
+import json
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 @dataclass
@@ -950,6 +1007,7 @@ class ModInfo:
     # For online mods
     modid: int = 0
     download_url: str = ""
+    tags: List[str] = field(default_factory=list)
 
 class ModManager:
     def __init__(self, log_fn):
@@ -976,35 +1034,60 @@ class ModManager:
     def parse_api_response(self, json_data: dict) -> List[ModInfo]:
         """Converts raw API JSON into ModInfo objects."""
         if not json_data or "mods" not in json_data:
+            self.log("[MOD-ERR] API response missing 'mods' key.")
             return []
         
+        raw_mods = json_data["mods"]
         results = []
-        for m in json_data["mods"]:
+        
+        for m in raw_mods:
             try:
-                name = m.get("name", "Unknown")
+                # Basic Fields
+                name = m.get("name", "Unknown Mod")
                 modid = m.get("modid", 0)
-                # API 'side': "both", "client", "server"
-                raw_side = m.get("side", "both")
                 
-                # Try to get the latest file URL
-                url = "" 
+                # Side Logic
+                raw_side = m.get("side", "both")
+                side_str = str(raw_side).title() if raw_side else "Both"
+
+                # Tags / Categories Extraction
+                tags_raw = m.get("tags", [])
+                if isinstance(tags_raw, str):
+                    tags = [t.strip().lower() for t in tags_raw.split(",")]
+                elif isinstance(tags_raw, list):
+                    tags = [str(t).strip().lower() for t in tags_raw]
+                else:
+                    tags = []
+
+                # URL Logic - The "Aggressive" Update
+                url = ""
                 if "lastrelease" in m and m["lastrelease"]:
-                    url = m["lastrelease"].get("mainfile", "")
-
-                if not url:
-                    continue # Skip mods with no download
-
+                    rel = m["lastrelease"]
+                    
+                    # 1. Try the nice field
+                    url = rel.get("mainfile", "")
+                    
+                    # 2. If empty or doesn't start with http, construct it manually
+                    if not url or not url.startswith("http"):
+                        if "fileid" in rel:
+                            # This is the standard VS Mod DB download format
+                            url = f"https://mods.vintagestory.at/files/asset/{rel['fileid']}"
+                
+                # Add to results
                 results.append(ModInfo(
                     filename=name,
                     path="",
                     size_bytes=0,
-                    side=str(raw_side).title(),
+                    side=side_str,
                     modid=modid,
-                    download_url=url
+                    download_url=url,
+                    tags=tags
                 ))
+
             except Exception:
                 continue
                 
+        self.log(f"[MOD] Successfully parsed {len(results)} items.")
         return sorted(results, key=lambda x: x.filename)
 
     def create_client_bundle(self, data_path: str, export_root: str, profile_name: str) -> Optional[Path]:
@@ -2503,6 +2586,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
 import threading
+import math
 
 from .base_tab import BaseTab
 
@@ -2510,6 +2594,7 @@ class ModsTab(BaseTab):
     TAB_ID = "mods"
     TAB_TITLE = "Mods"
     ORDER = 18
+    PAGE_SIZE = 50
 
     def __init__(self, controller, log_fn):
         super().__init__(controller, log_fn)
@@ -2517,127 +2602,142 @@ class ModsTab(BaseTab):
         # UI State
         self.var_profile_name = tk.StringVar()
         self.var_local_filter = tk.StringVar()
-        self.var_online_filter = tk.StringVar()
+        
+        # Online Filters
+        self.var_online_search = tk.StringVar()
+        self.var_online_category = tk.StringVar(value="All Categories")
+        self.var_online_side = tk.StringVar(value="Any Side")
+        
         self.var_status = tk.StringVar(value="Ready")
+        self.var_page_info = tk.StringVar(value="Page 1 of 1")
         
         # Data
-        self._local_rows = {}   # map iid -> filename
-        self._online_rows = {}  # map iid -> ModInfo object
-        self._online_cache = [] # Cache the API list
+        self._local_rows = {}   
+        self._online_rows = {}  
+        
+        self._all_online_mods = []      
+        self._filtered_online_mods = [] 
+        self._current_page = 0          
+        
+        self._known_tags = ["All Categories"] # Will populate dynamically
 
     def build(self, parent):
         self.frame = ttk.Frame(parent)
-        
-        # Master Layout: Notebook for separation
         self.notebook = ttk.Notebook(self.frame)
         self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
         
-        # --- TAB 1: INSTALLED (LOCAL) ---
+        # TAB 1: LOCAL
         self.tab_local = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_local, text="Installed (Local)")
         self._build_local_tab(self.tab_local)
         
-        # --- TAB 2: BROWSE (ONLINE) ---
+        # TAB 2: ONLINE
         self.tab_online = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_online, text="Browse (Online)")
         self._build_online_tab(self.tab_online)
 
-        # Status Bar at bottom of main frame
+        # Status Bar
         stat = ttk.Frame(self.frame, relief="sunken")
         stat.pack(fill="x", side="bottom")
         ttk.Label(stat, textvariable=self.var_status, font=("Segoe UI", 9)).pack(anchor="w", padx=5)
 
         return self.frame
 
-    # ============================================
-    # BUILDERS
-    # ============================================
-
     def _build_local_tab(self, parent):
+        # ... (Identical to previous version, omitted for brevity but structure maintained) ...
+        # For safety/completeness, using simplified rebuild here:
         parent.columnconfigure(0, weight=2)
         parent.columnconfigure(1, weight=1)
         parent.rowconfigure(0, weight=1)
 
-        # Left: Local List
         pnl_list = ttk.LabelFrame(parent, text="Library")
         pnl_list.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
         pnl_list.columnconfigure(0, weight=1)
         pnl_list.rowconfigure(1, weight=1)
 
-        # Filter
         flt = ttk.Frame(pnl_list)
         flt.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
         ttk.Label(flt, text="Filter:").pack(side="left")
         ttk.Entry(flt, textvariable=self.var_local_filter).pack(side="left", fill="x", expand=True, padx=5)
         self.var_local_filter.trace_add("write", lambda *args: self._refresh_local_list())
 
-        # Tree
         cols = ("name", "size", "side")
         self._tree_local = ttk.Treeview(pnl_list, columns=cols, show="headings")
         self._tree_local.heading("name", text="Filename")
         self._tree_local.heading("size", text="Size")
         self._tree_local.heading("side", text="Side")
         self._tree_local.column("name", width=200)
-        self._tree_local.column("size", width=70, anchor="e")
-        self._tree_local.column("side", width=70, anchor="center")
-
+        self._tree_local.grid(row=1, column=0, sticky="nsew", padx=5)
+        
         sb = ttk.Scrollbar(pnl_list, orient="vertical", command=self._tree_local.yview)
         self._tree_local.configure(yscrollcommand=sb.set)
-        
-        self._tree_local.grid(row=1, column=0, sticky="nsew", padx=5)
         sb.grid(row=1, column=1, sticky="ns", pady=5)
         
         ttk.Button(pnl_list, text="Refresh", command=self._refresh_local_list).grid(row=2, column=0, sticky="e", padx=5, pady=5)
 
-        # Right: Profiles & Bundle
         sidebar = ttk.Frame(parent)
         sidebar.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
         
-        # Profiles
         prof = ttk.LabelFrame(sidebar, text="Mod Profiles")
         prof.pack(fill="x", pady=(0, 15))
-        
         ttk.Label(prof, text="Profile Name:").pack(anchor="w", padx=10, pady=(5,0))
         self.cmb_profiles = ttk.Combobox(prof, textvariable=self.var_profile_name)
         self.cmb_profiles.pack(fill="x", padx=10, pady=5)
-        
         btn_row = ttk.Frame(prof)
         btn_row.pack(fill="x", padx=10, pady=5)
         ttk.Button(btn_row, text="Save", command=self._save_profile).pack(side="left", fill="x", expand=True)
-        ttk.Button(btn_row, text="Load", command=self._load_profile).pack(side="left", fill="x", expand=True, padx=(5,0))
+        ttk.Button(btn_row, text="Load", command=self._load_profile).pack(side="left", fill="x", expand=True)
 
-        # Bundle
-        dist = ttk.LabelFrame(sidebar, text="Client Distribution")
+        dist = ttk.LabelFrame(sidebar, text="Distribution")
         dist.pack(fill="x")
-        lbl = ttk.Label(dist, text="Create a .zip for players.", foreground="#B8AF9F")
-        lbl.pack(anchor="w", padx=10, pady=5)
         ttk.Button(dist, text="📦 Create Bundle", command=self._bundle_mods).pack(fill="x", padx=10, pady=10)
-
 
     def _build_online_tab(self, parent):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
 
-        # Top Bar
-        top = ttk.Frame(parent)
+        # --- Filter Bar (Advanced) ---
+        top = ttk.LabelFrame(parent, text="Advanced Filters")
         top.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
         
-        ttk.Button(top, text="☁️ Fetch Catalog", command=self._start_fetch_online).pack(side="left")
-        
-        ttk.Label(top, text="Search:").pack(side="left", padx=(20, 5))
-        ttk.Entry(top, textvariable=self.var_online_filter).pack(side="left", fill="x", expand=True)
-        self.var_online_filter.trace_add("write", lambda *args: self._filter_online_view())
+        # Row 1: Search & Fetch
+        r1 = ttk.Frame(top)
+        r1.pack(fill="x", padx=5, pady=5)
+        ttk.Button(r1, text="☁️ Fetch Catalog", command=self._start_fetch_online).pack(side="left")
+        ttk.Label(r1, text="Search Name:").pack(side="left", padx=(15, 5))
+        ttk.Entry(r1, textvariable=self.var_online_search).pack(side="left", fill="x", expand=True)
 
-        # Tree
-        cols = ("name", "side", "modid")
+        # Row 2: Categories & Sides
+        r2 = ttk.Frame(top)
+        r2.pack(fill="x", padx=5, pady=5)
+        
+        ttk.Label(r2, text="Category:").pack(side="left")
+        self.cmb_categories = ttk.Combobox(r2, textvariable=self.var_online_category, state="readonly", width=25)
+        self.cmb_categories.pack(side="left", padx=(5, 15))
+        self.cmb_categories['values'] = ["All Categories"]
+        
+        ttk.Label(r2, text="Side:").pack(side="left")
+        self.cmb_sides = ttk.Combobox(r2, textvariable=self.var_online_side, state="readonly", width=15)
+        self.cmb_sides.pack(side="left", padx=(5, 15))
+        self.cmb_sides['values'] = ["Any Side", "Client", "Server", "Both"]
+        
+        ttk.Button(r2, text="Apply Filters", command=self._apply_online_filter).pack(side="right")
+
+        # Triggers
+        self.var_online_search.trace_add("write", lambda *args: self._apply_online_filter())
+        self.cmb_categories.bind("<<ComboboxSelected>>", lambda e: self._apply_online_filter())
+        self.cmb_sides.bind("<<ComboboxSelected>>", lambda e: self._apply_online_filter())
+
+        # --- Tree ---
+        cols = ("name", "side", "tags") # Added Tags column
         self._tree_online = ttk.Treeview(parent, columns=cols, show="headings")
         self._tree_online.heading("name", text="Mod Name")
         self._tree_online.heading("side", text="Side")
-        self._tree_online.heading("modid", text="ID")
+        self._tree_online.heading("tags", text="Tags")
         
-        self._tree_online.column("name", width=300)
-        self._tree_online.column("side", width=80, anchor="center")
-        self._tree_online.column("modid", width=50, anchor="e")
+        self._tree_online.column("name", width=250)
+        self._tree_online.column("side", width=60, anchor="center")
+        self._tree_online.column("tags", width=200, anchor="w")
         
         sb = ttk.Scrollbar(parent, orient="vertical", command=self._tree_online.yview)
         self._tree_online.configure(yscrollcommand=sb.set)
@@ -2645,15 +2745,17 @@ class ModsTab(BaseTab):
         self._tree_online.grid(row=1, column=0, sticky="nsew", padx=10)
         sb.grid(row=1, column=1, sticky="ns", padx=(0,10), pady=10)
 
-        # Bottom Action
-        act = ttk.Frame(parent)
-        act.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+        # --- Pagination ---
+        pag = ttk.Frame(parent)
+        pag.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
         
-        ttk.Button(act, text="⬇️ Download Selected", command=self._start_download).pack(side="right")
-
+        ttk.Button(pag, text="< Prev", command=self._prev_page).pack(side="left")
+        ttk.Label(pag, textvariable=self.var_page_info).pack(side="left", padx=15)
+        ttk.Button(pag, text="Next >", command=self._next_page).pack(side="left")
+        ttk.Button(pag, text="⬇️ Download Selected", command=self._start_download).pack(side="right")
 
     # ============================================
-    # LOGIC: LOCAL
+    # LOGIC
     # ============================================
 
     def on_show(self):
@@ -2661,20 +2763,15 @@ class ModsTab(BaseTab):
         self._refresh_profiles()
 
     def _refresh_local_list(self):
-        # Clear
         for iid in self._tree_local.get_children():
             self._tree_local.delete(iid)
         self._local_rows.clear()
-
         if not hasattr(self.controller, "list_mods"): return
-
+        
         mods = self.controller.list_mods()
         flt = self.var_local_filter.get().lower()
-
         for i, m in enumerate(mods):
-            if flt and flt not in m.filename.lower():
-                continue
-            
+            if flt and flt not in m.filename.lower(): continue
             size_mb = f"{m.size_bytes / (1024*1024):.2f} MB"
             iid = f"loc_{i}"
             self._tree_local.insert("", "end", iid=iid, values=(m.filename, size_mb, m.side))
@@ -2686,110 +2783,138 @@ class ModsTab(BaseTab):
 
     def _save_profile(self):
         name = self.var_profile_name.get().strip()
-        if not name: return
-        
-        # Save current list
-        current_mods = list(self._local_rows.values())
-        self.controller.update_state(lambda s: s.mod_profiles.update({name: current_mods}) or s)
-        self.controller.save_state()
-        self._refresh_profiles()
-        messagebox.showinfo("Saved", f"Profile '{name}' saved.")
+        if name:
+            current_mods = list(self._local_rows.values())
+            self.controller.update_state(lambda s: s.mod_profiles.update({name: current_mods}) or s)
+            self.controller.save_state()
+            self._refresh_profiles()
 
     def _load_profile(self):
-        # Just info for now
         name = self.var_profile_name.get().strip()
         state = self.controller.get_state()
         if name in state.mod_profiles:
-            count = len(state.mod_profiles[name])
-            messagebox.showinfo("Profile", f"Profile '{name}' has {count} mods.\n(Sync logic coming in Wave 3.2)")
+            messagebox.showinfo("Profile", f"Profile '{name}' has {len(state.mod_profiles[name])} mods.")
 
     def _bundle_mods(self):
         name = self.var_profile_name.get().strip() or "Custom"
-        path = self.controller.bundle_mods_for_players(name)
-        if path:
-            messagebox.showinfo("Bundle Ready", f"Saved to:\n{path}")
-        else:
-            messagebox.showerror("Error", "Bundle creation failed.")
+        self.controller.bundle_mods_for_players(name)
 
-    # ============================================
-    # LOGIC: ONLINE (THREADED)
-    # ============================================
+    # --- ONLINE LOGIC ---
 
     def _start_fetch_online(self):
         self.var_status.set("Fetching ModDB...")
-        # Run in thread
         t = threading.Thread(target=self._thread_fetch, daemon=True)
         t.start()
 
     def _thread_fetch(self):
         try:
-            # Calls the network client via controller
             results = self.controller.fetch_online_mods()
-            # UI Update on main thread
             self.frame.after(0, self._on_fetch_complete, results)
         except Exception as e:
             self.frame.after(0, lambda: messagebox.showerror("Error", str(e)))
 
     def _on_fetch_complete(self, results):
-        self._online_cache = results
-        self.var_status.set(f"Catalog loaded: {len(results)} mods found.")
-        self._filter_online_view()
+        self._all_online_mods = results
+        self.var_status.set(f"Catalog loaded: {len(results)} mods.")
+        
+        # Dynamic Tag Extraction
+        unique_tags = set()
+        for m in results:
+            for t in m.tags:
+                unique_tags.add(t)
+        
+        sorted_tags = sorted(list(unique_tags))
+        self.cmb_categories['values'] = ["All Categories"] + sorted_tags
+        
+        self._apply_online_filter()
 
-    def _filter_online_view(self):
-        # clear
+    def _apply_online_filter(self):
+        search = self.var_online_search.get().lower()
+        cat = self.var_online_category.get()
+        side = self.var_online_side.get()
+
+        filtered = []
+        for m in self._all_online_mods:
+            # 1. Search Check
+            if search and search not in m.filename.lower():
+                continue
+            
+            # 2. Category Check
+            if cat != "All Categories":
+                if cat not in m.tags:
+                    continue
+            
+            # 3. Side Check
+            if side != "Any Side":
+                # API sides are "Both", "Client", "Server"
+                # If mod is "Both", it matches Client AND Server requests usually
+                # But strict matching:
+                if m.side.lower() != side.lower() and m.side.lower() != "both":
+                    continue
+
+            filtered.append(m)
+
+        self._filtered_online_mods = filtered
+        self._current_page = 0
+        self._render_online_page()
+
+    def _render_online_page(self):
         for iid in self._tree_online.get_children():
             self._tree_online.delete(iid)
         self._online_rows.clear()
 
-        flt = self.var_online_filter.get().lower()
-        
-        count = 0
-        for i, m in enumerate(self._online_cache):
-            if flt and flt not in m.filename.lower():
-                continue
-            
-            # Limit display count for performance if empty filter
-            if not flt and count > 100:
-                break
-                
-            iid = f"onl_{i}"
-            self._tree_online.insert("", "end", iid=iid, values=(m.filename, m.side, m.modid))
+        total = len(self._filtered_online_mods)
+        if total == 0:
+            self.var_page_info.set("No results")
+            return
+
+        start = self._current_page * self.PAGE_SIZE
+        end = start + self.PAGE_SIZE
+        page_items = self._filtered_online_mods[start:end]
+
+        for i, m in enumerate(page_items):
+            tags_str = ", ".join(m.tags[:3]) # Show first 3 tags
+            iid = f"onl_{start + i}"
+            self._tree_online.insert("", "end", iid=iid, values=(m.filename, m.side, tags_str))
             self._online_rows[iid] = m
-            count += 1
+
+        total_pages = math.ceil(total / self.PAGE_SIZE)
+        self.var_page_info.set(f"Page {self._current_page + 1} of {total_pages} ({total} mods)")
+
+    def _next_page(self):
+        total = len(self._filtered_online_mods)
+        max_page = math.ceil(total / self.PAGE_SIZE) - 1
+        if self._current_page < max_page:
+            self._current_page += 1
+            self._render_online_page()
+
+    def _prev_page(self):
+        if self._current_page > 0:
+            self._current_page -= 1
+            self._render_online_page()
 
     def _start_download(self):
         sel = self._tree_online.selection()
-        if not sel:
-            return
-        
+        if not sel: return
         item_id = sel[0]
         mod_info = self._online_rows.get(item_id)
-        
         if not mod_info or not mod_info.download_url:
-            messagebox.showerror("Unavailable", "This mod does not have a direct download URL.")
+            messagebox.showerror("Unavailable", "No download URL.")
             return
 
-        confirm = messagebox.askyesno("Download", f"Download '{mod_info.filename}'?")
-        if not confirm:
-            return
-
-        self.var_status.set(f"Downloading {mod_info.filename}...")
-        t = threading.Thread(target=self._thread_download, args=(mod_info,), daemon=True)
-        t.start()
+        if messagebox.askyesno("Download", f"Download '{mod_info.filename}'?"):
+            self.var_status.set(f"Downloading {mod_info.filename}...")
+            t = threading.Thread(target=self._thread_download, args=(mod_info,), daemon=True)
+            t.start()
 
     def _thread_download(self, mod_info):
         try:
-            # Generate a filename if the URL doesn't have one clearly
             fname = f"{mod_info.filename.replace(' ', '_')}.zip"
-            
             self.controller.install_mod_from_url(mod_info.download_url, fname)
-            
             self.frame.after(0, lambda: self.var_status.set(f"Installed: {mod_info.filename}"))
             self.frame.after(0, self._refresh_local_list)
-            self.frame.after(0, lambda: messagebox.showinfo("Success", f"Installed {mod_info.filename}"))
         except Exception as e:
             self.frame.after(0, lambda: messagebox.showerror("Download Failed", str(e)))
-            self.frame.after(0, lambda: self.var_status.set("Download failed."))
 --------------------------------------------------------------------------------
 FILE: src\ui_core\tabs\player_tab.py
 --------------------------------------------------------------------------------
@@ -3323,171 +3448,320 @@ from .base_tab import BaseTab
 class WorldTab(BaseTab):
     TAB_ID = "world"
     TAB_TITLE = "World Gen"
-    ORDER = 15  # Place between Server (10) and Backups (20)
+    ORDER = 15
 
     def __init__(self, controller, log_fn):
         super().__init__(controller, log_fn)
 
-        # --- Standard Config ---
+        # --- Identity ---
         self.var_world_name = tk.StringVar(value="NewWorld")
         self.var_seed = tk.StringVar()
+
+        # --- Tab 1: Genesis (Map) ---
         self.var_width = tk.IntVar(value=1024000)
         self.var_height = tk.IntVar(value=256)
-        
-        # --- Granular "Crazy" Config (Sliders) ---
-        # These map to specific WorldConfig keys if supported by the engine/mods
-        self.var_sealevel = tk.DoubleVar(value=0.43)  # Standard VS default
-        self.var_upheaval = tk.DoubleVar(value=0.0)   # Distortion/Mountains
-        
-        # --- Advanced / Modded ---
-        # A raw JSON text area for specific mod keys (e.g. "rivers": true)
+        self.var_sealevel = tk.DoubleVar(value=0.43)
+        self.var_landcover = tk.DoubleVar(value=1.0) # 1.0 = 100%
+        self.var_upheaval = tk.DoubleVar(value=0.0)
+        self.var_geo_activity = tk.StringVar(value="weak")
+        self.var_climate = tk.StringVar(value="realistic")
+        self.var_global_ores = tk.DoubleVar(value=1.0)
+        self.var_copper = tk.StringVar(value="common")
+        self.var_tin = tk.StringVar(value="rare")
+
+        # --- Tab 2: Survival (Rules) ---
+        self.var_gamemode = tk.StringVar(value="survival")
+        self.var_grace_timer = tk.IntVar(value=0)
+        self.var_death_punish = tk.StringVar(value="dropall")
+        self.var_hunger = tk.DoubleVar(value=1.0)
+        self.var_hostility = tk.StringVar(value="aggressive")
+        self.var_gravity = tk.StringVar(value="sandgravel") # sandgravel or none
+        self.var_microblock = tk.IntVar(value=2) # 0, 1, 2
+        self.var_class_exclusive = tk.BooleanVar(value=True)
+        self.var_tool_durability = tk.DoubleVar(value=1.0)
+
+        # --- Tab 3: Temporal (Clockwork) ---
+        self.var_stability = tk.BooleanVar(value=True)
+        self.var_storms = tk.StringVar(value="sometimes")
+        self.var_rifts = tk.StringVar(value="visible")
+        self.var_sleep_storms = tk.BooleanVar(value=False)
+
+        # --- Tab 4: Advanced ---
         self.txt_extra_json = None
 
     def build(self, parent):
         self.frame = ttk.Frame(parent)
         
-        # Layout: 2 Columns
-        # Col 0: Standard Settings & Dimensions
-        # Col 1: Advanced Generation & Mod Configs
+        # Layout: Top (Identity) + Center (Notebook) + Bottom (Actions)
         self.frame.columnconfigure(0, weight=1)
-        self.frame.columnconfigure(1, weight=1)
+        self.frame.rowconfigure(1, weight=1)
 
-        # ============================================
-        # COLUMN 0: Identity & Physics
-        # ============================================
+        # 1. Identity Header
+        top = ttk.LabelFrame(self.frame, text="World Identity")
+        top.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        top.columnconfigure(1, weight=1)
+        top.columnconfigure(3, weight=1)
+
+        ttk.Label(top, text="World Name:").grid(row=0, column=0, sticky="w", padx=10, pady=10)
+        ttk.Entry(top, textvariable=self.var_world_name).grid(row=0, column=1, sticky="ew", padx=10)
+
+        ttk.Label(top, text="Seed:").grid(row=0, column=2, sticky="w", padx=10)
+        ttk.Entry(top, textvariable=self.var_seed).grid(row=0, column=3, sticky="ew", padx=10)
+
+        # 2. The Engine (Notebook)
+        self.notebook = ttk.Notebook(self.frame)
+        self.notebook.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
+
+        # --- Sub-Tab: GENESIS ---
+        tab_gen = ttk.Frame(self.notebook)
+        self.notebook.add(tab_gen, text="Genesis")
+        self._build_genesis_tab(tab_gen)
+
+        # --- Sub-Tab: SURVIVAL ---
+        tab_surv = ttk.Frame(self.notebook)
+        self.notebook.add(tab_surv, text="Survival")
+        self._build_survival_tab(tab_surv)
+
+        # --- Sub-Tab: TEMPORAL ---
+        tab_time = ttk.Frame(self.notebook)
+        self.notebook.add(tab_time, text="Temporal")
+        self._build_temporal_tab(tab_time)
+
+        # --- Sub-Tab: ADVANCED ---
+        tab_adv = ttk.Frame(self.notebook)
+        self.notebook.add(tab_adv, text="Advanced (JSON)")
+        self._build_advanced_tab(tab_adv)
+
+        # 3. Actions Footer
+        bot = ttk.Frame(self.frame)
+        bot.grid(row=2, column=0, sticky="ew", padx=12, pady=12)
         
-        # --- Panel: Identification ---
-        ident = ttk.LabelFrame(self.frame, text="Identity")
-        ident.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
-        ident.columnconfigure(1, weight=1)
+        ttk.Button(bot, text="Save Configuration", command=self._save_config).pack(side="right")
+        ttk.Button(bot, text="Revert to Saved", command=self._load_from_state).pack(side="right", padx=10)
 
-        ttk.Label(ident, text="World Name:").grid(row=0, column=0, sticky="w", padx=10, pady=6)
-        ttk.Entry(ident, textvariable=self.var_world_name).grid(row=0, column=1, sticky="ew", padx=10, pady=6)
+        self._load_from_state()
+        return self.frame
 
-        ttk.Label(ident, text="Seed (Empty = Random):").grid(row=1, column=0, sticky="w", padx=10, pady=6)
-        ttk.Entry(ident, textvariable=self.var_seed).grid(row=1, column=1, sticky="ew", padx=10, pady=6)
+    # =========================================================
+    # BUILDERS
+    # =========================================================
 
-        # --- Panel: Dimensions (Granular Control) ---
-        dims = ttk.LabelFrame(self.frame, text="Dimensions & Boundaries")
-        dims.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        dims.columnconfigure(1, weight=1)
+    def _build_genesis_tab(self, parent):
+        parent.columnconfigure(1, weight=1)
+        parent.columnconfigure(3, weight=1)
 
-        # Width
-        ttk.Label(dims, text="World Width (X/Z):").grid(row=0, column=0, sticky="w", padx=10, pady=6)
-        # Spinbox for granular steps, but allow typing
-        wb = ttk.Spinbox(dims, from_=512, to=30000000, increment=512, textvariable=self.var_width)
-        wb.grid(row=0, column=1, sticky="ew", padx=10, pady=6)
+        # Dimensions
+        g_dim = ttk.LabelFrame(parent, text="Dimensions")
+        g_dim.pack(fill="x", padx=10, pady=10)
         
-        # Height
-        ttk.Label(dims, text="World Height (Y):").grid(row=1, column=0, sticky="w", padx=10, pady=6)
-        hb = ttk.Spinbox(dims, from_=256, to=1024, increment=16, textvariable=self.var_height)
-        hb.grid(row=1, column=1, sticky="ew", padx=10, pady=6)
+        ttk.Label(g_dim, text="Width (X/Z):").grid(row=0, column=0, padx=10, pady=5)
+        ttk.Spinbox(g_dim, from_=512, to=30000000, increment=512, textvariable=self.var_width).grid(row=0, column=1, sticky="ew")
         
-        ttk.Label(dims, text="⚠️ Changing Height requires a fresh world!", foreground="#D96D2B").grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=2)
+        ttk.Label(g_dim, text="Height (Y):").grid(row=0, column=2, padx=10)
+        ttk.Spinbox(g_dim, from_=256, to=1024, increment=16, textvariable=self.var_height).grid(row=0, column=3, sticky="ew")
+
+        # Terrain
+        g_ter = ttk.LabelFrame(parent, text="Terrain & Oceans")
+        g_ter.pack(fill="x", padx=10, pady=5)
+        g_ter.columnconfigure(1, weight=1)
+
+        # Sea Level
+        ttk.Label(g_ter, text="Sea Level:").grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        ttk.Scale(g_ter, from_=0.1, to=1.0, variable=self.var_sealevel).grid(row=0, column=1, sticky="ew", padx=10)
+        ttk.Label(g_ter, textvariable=self.var_sealevel).grid(row=0, column=2, padx=10)
+
+        # Landcover
+        ttk.Label(g_ter, text="Landcover:").grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        ttk.Scale(g_ter, from_=0.1, to=5.0, variable=self.var_landcover).grid(row=1, column=1, sticky="ew", padx=10)
+        ttk.Label(g_ter, textvariable=self.var_landcover).grid(row=1, column=2, padx=10)
+
+        # Upheaval
+        ttk.Label(g_ter, text="Upheaval Rate:").grid(row=2, column=0, sticky="w", padx=10, pady=5)
+        ttk.Scale(g_ter, from_=0.0, to=5.0, variable=self.var_upheaval).grid(row=2, column=1, sticky="ew", padx=10)
+        ttk.Label(g_ter, textvariable=self.var_upheaval).grid(row=2, column=2, padx=10)
+
+        # Resources
+        g_res = ttk.LabelFrame(parent, text="Resources & Climate")
+        g_res.pack(fill="x", padx=10, pady=10)
+        
+        ttk.Label(g_res, text="Global Ores (Multiplier):").grid(row=0, column=0, padx=10, pady=5)
+        ttk.Spinbox(g_res, from_=0.1, to=5.0, increment=0.1, textvariable=self.var_global_ores, width=5).grid(row=0, column=1)
+
+        ttk.Label(g_res, text="Surface Copper:").grid(row=0, column=2, padx=10)
+        cb_cop = ttk.Combobox(g_res, textvariable=self.var_copper, values=["common", "uncommon", "rare", "very rare"], width=10)
+        cb_cop.grid(row=0, column=3)
+
+        ttk.Label(g_res, text="Surface Tin:").grid(row=0, column=4, padx=10)
+        cb_tin = ttk.Combobox(g_res, textvariable=self.var_tin, values=["common", "uncommon", "rare", "very rare"], width=10)
+        cb_tin.grid(row=0, column=5)
 
 
-        # ============================================
-        # COLUMN 1: Generation & Mods
-        # ============================================
+    def _build_survival_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
 
-        # --- Panel: Terrain Features ---
-        terrain = ttk.LabelFrame(self.frame, text="Terrain & Climate")
-        terrain.grid(row=0, column=1, sticky="nsew", padx=12, pady=12)
-        terrain.columnconfigure(1, weight=1)
+        # Difficulty
+        s_diff = ttk.LabelFrame(parent, text="Core Difficulty")
+        s_diff.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
+        
+        ttk.Label(s_diff, text="Game Mode:").grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        ttk.Combobox(s_diff, textvariable=self.var_gamemode, values=["survival", "creative"]).grid(row=0, column=1, sticky="w")
 
-        # Sea Level Slider
-        ttk.Label(terrain, text="Sea Level Ratio:").grid(row=0, column=0, sticky="w", padx=10, pady=(6,0))
-        sl = ttk.Scale(terrain, from_=0.1, to=1.0, variable=self.var_sealevel, orient="horizontal")
-        sl.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
-        # Value readout
-        ttk.Label(terrain, textvariable=self.var_sealevel).grid(row=0, column=1, sticky="e", padx=10)
+        ttk.Label(s_diff, text="Death Penalty:").grid(row=0, column=2, sticky="w", padx=10)
+        ttk.Combobox(s_diff, textvariable=self.var_death_punish, values=["dropall", "dropgear", "keepall"]).grid(row=0, column=3, sticky="w")
 
-        # Upheaval / Geologic Activity (Conceptual mapping to world gen noise)
-        ttk.Label(terrain, text="Geologic Upheaval (Noise):").grid(row=2, column=0, sticky="w", padx=10, pady=(6,0))
-        up = ttk.Scale(terrain, from_=0.0, to=5.0, variable=self.var_upheaval, orient="horizontal")
-        up.grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
-        ttk.Label(terrain, textvariable=self.var_upheaval).grid(row=2, column=1, sticky="e", padx=10)
+        ttk.Label(s_diff, text="Grace Timer (Days):").grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        ttk.Spinbox(s_diff, from_=0, to=100, textvariable=self.var_grace_timer, width=5).grid(row=1, column=1, sticky="w")
 
-        # --- Panel: JSON Overrides (For Mods) ---
-        mods = ttk.LabelFrame(self.frame, text="Advanced / Mod Config (JSON)")
-        mods.grid(row=1, column=1, sticky="nsew", padx=12, pady=(0, 12))
-        mods.columnconfigure(0, weight=1)
-        mods.rowconfigure(0, weight=1)
+        # Mechanics
+        s_mech = ttk.LabelFrame(parent, text="Mechanics")
+        s_mech.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        
+        ttk.Label(s_mech, text="Hunger Rate:").pack(anchor="w", padx=10, pady=2)
+        ttk.Scale(s_mech, from_=0.1, to=3.0, variable=self.var_hunger).pack(fill="x", padx=10, pady=5)
+        
+        ttk.Label(s_mech, text="Tool Durability:").pack(anchor="w", padx=10, pady=2)
+        ttk.Scale(s_mech, from_=0.1, to=5.0, variable=self.var_tool_durability).pack(fill="x", padx=10, pady=5)
 
-        self.txt_extra_json = tk.Text(mods, height=8, width=30, wrap="word")
+        ttk.Checkbutton(s_mech, text="Class Exclusive Recipes", variable=self.var_class_exclusive).pack(anchor="w", padx=10, pady=5)
+
+        # Physics
+        s_phys = ttk.LabelFrame(parent, text="Physics")
+        s_phys.grid(row=1, column=1, sticky="nsew", padx=10, pady=5)
+
+        ttk.Label(s_phys, text="Block Gravity:").pack(anchor="w", padx=10, pady=2)
+        ttk.Combobox(s_phys, textvariable=self.var_gravity, values=["sandgravel", "none"]).pack(fill="x", padx=10, pady=2)
+
+        ttk.Label(s_phys, text="Microblock Chiseling:").pack(anchor="w", padx=10, pady=2)
+        ttk.Combobox(s_phys, textvariable=self.var_microblock, values=[0, 1, 2]).pack(fill="x", padx=10, pady=2)
+        ttk.Label(s_phys, text="(0=Off, 1=Basic, 2=Creative/All)", font=("Segoe UI", 8), foreground="#7B7468").pack(anchor="w", padx=10)
+
+    def _build_temporal_tab(self, parent):
+        t_pnl = ttk.LabelFrame(parent, text="Temporal Stability")
+        t_pnl.pack(fill="x", padx=10, pady=10)
+
+        ttk.Checkbutton(t_pnl, text="Enable Temporal Stability", variable=self.var_stability).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=10)
+
+        ttk.Label(t_pnl, text="Temporal Storms:").grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        ttk.Combobox(t_pnl, textvariable=self.var_storms, values=["off", "rare", "sometimes", "often", "veryoften"]).grid(row=1, column=1, sticky="ew")
+
+        ttk.Label(t_pnl, text="Temporal Rifts:").grid(row=2, column=0, sticky="w", padx=10, pady=5)
+        ttk.Combobox(t_pnl, textvariable=self.var_rifts, values=["off", "visible", "invisible"]).grid(row=2, column=1, sticky="ew")
+
+        ttk.Checkbutton(t_pnl, text="Allow Sleep During Storms", variable=self.var_sleep_storms).grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=10)
+
+    def _build_advanced_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        self.txt_extra_json = tk.Text(parent, height=10, width=40, wrap="word")
         self.txt_extra_json.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
         
-        # Scrollbar for JSON area
-        sb = ttk.Scrollbar(mods, orient="vertical", command=self.txt_extra_json.yview)
+        sb = ttk.Scrollbar(parent, orient="vertical", command=self.txt_extra_json.yview)
         self.txt_extra_json.configure(yscrollcommand=sb.set)
         sb.grid(row=0, column=1, sticky="ns", pady=10)
         
-        ttk.Label(mods, text="Paste mod specific world-gen keys here.").grid(row=1, column=0, sticky="w", padx=10, pady=(0,6))
+        ttk.Label(parent, text="Use this for mod-specific keys not covered in other tabs.", foreground="#B8AF9F").grid(row=1, column=0, sticky="w", padx=10, pady=(0,10))
 
-        # --- Footer Actions ---
-        actions = ttk.Frame(self.frame)
-        actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=12)
-        
-        ttk.Button(actions, text="Save World Config", command=self._save_config).pack(side="right")
-        ttk.Button(actions, text="Revert Changes", command=self._load_from_state).pack(side="right", padx=(0, 10))
 
-        # Initial Load
-        self._load_from_state()
-
-        return self.frame
-
-    # -------------------------
-    # Logic
-    # -------------------------
+    # =========================================================
+    # LOGIC
+    # =========================================================
 
     def _load_from_state(self):
         state = self.controller.get_state()
-        settings = state.world_settings
+        s = state.world_settings
 
-        self.var_world_name.set(settings.get("WorldName", "NewWorld"))
-        self.var_seed.set(settings.get("Seed", ""))
-        self.var_width.set(int(settings.get("WorldWidth", 1024000)))
-        self.var_height.set(int(settings.get("WorldHeight", 256)))
-        
-        # Load advanced JSON if exists
-        extra = settings.get("ExtraConfig", {})
-        self.txt_extra_json.delete("1.0", "end")
-        self.txt_extra_json.insert("1.0", json.dumps(extra, indent=2))
+        # Identity
+        self.var_world_name.set(s.get("WorldName", "NewWorld"))
+        self.var_seed.set(s.get("Seed", ""))
+
+        # Genesis
+        self.var_width.set(s.get("WorldWidth", 1024000))
+        self.var_height.set(s.get("WorldHeight", 256))
+        self.var_sealevel.set(s.get("SeaLevel", 0.43))
+        self.var_landcover.set(s.get("Landcover", 1.0))
+        self.var_upheaval.set(s.get("UpheavalRate", 0.0))
+        self.var_global_ores.set(s.get("GlobalDepositSpawnRate", 1.0))
+        self.var_copper.set(s.get("SurfaceCopperDepositFrequency", "common"))
+        self.var_tin.set(s.get("SurfaceTinDepositFrequency", "rare"))
+
+        # Survival
+        self.var_gamemode.set(s.get("GameMode", "survival"))
+        self.var_grace_timer.set(s.get("GraceTimer", 0))
+        self.var_death_punish.set(s.get("DeathPunishment", "dropall"))
+        self.var_hunger.set(s.get("HungerRate", 1.0))
+        self.var_gravity.set(s.get("BlockGravity", "sandgravel"))
+        self.var_microblock.set(s.get("MicroblockChiseling", 2))
+        self.var_class_exclusive.set(s.get("ClassExclusiveRecipes", True))
+        self.var_tool_durability.set(s.get("ToolDurability", 1.0))
+
+        # Temporal
+        self.var_stability.set(s.get("TemporalStability", True))
+        self.var_storms.set(s.get("TemporalStorms", "sometimes"))
+        self.var_rifts.set(s.get("TemporalRifts", "visible"))
+        self.var_sleep_storms.set(s.get("SleepDuringStorms", False))
+
+        # Advanced JSON
+        extra = s.get("ExtraConfig", {})
+        if self.txt_extra_json:
+            self.txt_extra_json.delete("1.0", "end")
+            self.txt_extra_json.insert("1.0", json.dumps(extra, indent=2))
 
     def _save_config(self):
-        # 1. Gather basic fields
-        new_settings = {
-            "WorldName": self.var_world_name.get().strip(),
-            "Seed": self.var_seed.get().strip(),
-            "WorldWidth": self.var_width.get(),
-            "WorldHeight": self.var_height.get(),
-            # These are virtual fields we might map to specific JSON keys later
-            "SeaLevel": self.var_sealevel.get(),
-            "Upheaval": self.var_upheaval.get() 
-        }
+        # 1. Harvest all vars
+        try:
+            new_settings = {
+                "WorldName": self.var_world_name.get().strip(),
+                "Seed": self.var_seed.get().strip(),
+                
+                # Genesis
+                "WorldWidth": self.var_width.get(),
+                "WorldHeight": self.var_height.get(),
+                "SeaLevel": self.var_sealevel.get(),
+                "Landcover": self.var_landcover.get(),
+                "UpheavalRate": self.var_upheaval.get(),
+                "GlobalDepositSpawnRate": self.var_global_ores.get(),
+                "SurfaceCopperDepositFrequency": self.var_copper.get(),
+                "SurfaceTinDepositFrequency": self.var_tin.get(),
+
+                # Survival
+                "GameMode": self.var_gamemode.get(),
+                "GraceTimer": self.var_grace_timer.get(),
+                "DeathPunishment": self.var_death_punish.get(),
+                "HungerRate": self.var_hunger.get(),
+                "BlockGravity": self.var_gravity.get(),
+                "MicroblockChiseling": self.var_microblock.get(),
+                "ClassExclusiveRecipes": self.var_class_exclusive.get(),
+                "ToolDurability": self.var_tool_durability.get(),
+
+                # Temporal
+                "TemporalStability": self.var_stability.get(),
+                "TemporalStorms": self.var_storms.get(),
+                "TemporalRifts": self.var_rifts.get(),
+                "SleepDuringStorms": self.var_sleep_storms.get(),
+            }
+        except Exception as e:
+            messagebox.showerror("Validation Error", f"Check your inputs:\n{e}")
+            return
 
         # 2. Parse Extra JSON
-        raw_json = self.txt_extra_json.get("1.0", "end").strip()
-        if raw_json:
-            try:
-                extra = json.loads(raw_json)
-                new_settings["ExtraConfig"] = extra
-            except json.JSONDecodeError as e:
-                messagebox.showerror("Invalid JSON", f"Mod Config JSON is invalid:\n{e}")
-                return
+        if self.txt_extra_json:
+            raw_json = self.txt_extra_json.get("1.0", "end").strip()
+            if raw_json:
+                try:
+                    extra = json.loads(raw_json)
+                    new_settings["ExtraConfig"] = extra
+                except json.JSONDecodeError as e:
+                    messagebox.showerror("Invalid JSON", f"Advanced Config JSON is invalid:\n{e}")
+                    return
 
         # 3. Send to Controller
-        try:
-            # Note: You need to implement update_world_settings in AppController (Phase 2)
-            if hasattr(self.controller, "update_world_settings"):
-                self.controller.update_world_settings(new_settings)
-                messagebox.showinfo("Saved", "World settings saved to internal state.\n(Server restart required to apply to new worlds)")
-            else:
-                self.log("[ERROR] Controller missing update_world_settings method.")
-        except Exception as e:
-            self.log(f"[ERROR] Failed to save world settings: {e}")
-            messagebox.showerror("Error", str(e))
-
+        if hasattr(self.controller, "update_world_settings"):
+            self.controller.update_world_settings(new_settings)
+            messagebox.showinfo("Saved", "World Config saved.\n\nNote: Changes only affect NEW worlds.\nDelete your old save if you want these to take effect.")
+        else:
+            self.log("[ERROR] Controller missing update_world_settings")
 --------------------------------------------------------------------------------
 FILE: src\ui_core\widgets\log_view.py
 --------------------------------------------------------------------------------
