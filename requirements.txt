@@ -1,0 +1,4 @@
+# requirements.txt
+# This app uses only the Python standard library + Tkinter (bundled with most CPython installs).
+# No third-party packages required.
+

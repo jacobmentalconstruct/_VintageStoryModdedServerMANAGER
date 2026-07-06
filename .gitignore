@@ -1,0 +1,103 @@
+# -----------------------------------------------------------------------------
+# Python Caches & Bytecode
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# -----------------------------------------------------------------------------
+# Virtual Environments
+# -----------------------------------------------------------------------------
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+
+# -----------------------------------------------------------------------------
+# Build / Distribution Artifacts
+# -----------------------------------------------------------------------------
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# -----------------------------------------------------------------------------
+# IDE / Editor Files
+# -----------------------------------------------------------------------------
+.vscode/
+.vscode-test/
+.idea/
+*.code-workspace
+
+# -----------------------------------------------------------------------------
+# OS-Level Junk
+# -----------------------------------------------------------------------------
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*.tmp
+*.bak
+
+# -----------------------------------------------------------------------------
+# Logs / Runtime Output
+# -----------------------------------------------------------------------------
+*.log
+logs/
+_logs/
+*.out
+
+# -----------------------------------------------------------------------------
+# Tkinter & App Temp Files
+# -----------------------------------------------------------------------------
+__appcache__/
+*.db-journal
+
+# -----------------------------------------------------------------------------
+# Python-specific Dev Tools
+# -----------------------------------------------------------------------------
+pytest_cache/
+.coverage
+.tox/
+.mypy_cache/
+.pytest_cache/
+.cache/
+.agents/
+
+# -----------------------------------------------------------------------------
+# Project-Specific Exclusions
+# -----------------------------------------------------------------------------
+# Prevent accidental inclusion of personal configurations or secrets.
+local_settings.json
+config.local.json
+secrets.json
+
+# Local Vintage Story manager state and generated server data.
+# These folders can contain unpacked mods, save databases, caches, archives, and
+# very deep paths that Git on Windows may fail to index.
+mods/
+servers/
+server_archives/
+src/vs_server_manager_config.json
+src/serverconfig.json
+
+# Vintage Story runtime folders/files if a data path is ever pointed at the repo.
+Cache/
+Saves/
+Mods/
+Logs/
+serverconfig.json
+servermagicnumbers.json
+*.vcdbs
+*.vcdbs-*
+*.db-shm
+*.db-wal
+
+# -----------------------------------------------------------------------------
+# Ignore the user’s entire Windows PATH junk accidentally copied in
+# -----------------------------------------------------------------------------
+$RECYCLE.BIN/
